@@ -1,0 +1,263 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mercure.fullname" . }}
+  labels:
+    {{- include "mercure.labels" . | nindent 4 }}
+  {{- with .Values.deployment.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- else if .Release.IsInstall }}
+  # Seed at minReplicas on fresh install so the HPA doesn't have to scale
+  # up from k8s' default of 1. Omitted on upgrade so the HPA keeps ownership.
+  replicas: {{ .Values.autoscaling.minReplicas }}
+  {{- end }}
+  strategy:
+    type: {{ .Values.updateStrategy.type }}
+    {{- if eq .Values.updateStrategy.type "RollingUpdate" }}
+    # Rotate one pod at a time without dropping capacity. Pacing is slow
+    # on purpose so the ingress and transport absorb SSE reconnects in
+    # batches instead of as a single storm.
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    {{- end }}
+  {{- if eq .Values.updateStrategy.type "RollingUpdate" }}
+  # 30s gap between Ready and Available paces the rollout (with
+  # maxSurge=1/maxUnavailable=0) and lets transport loops (BoltDB warm-up,
+  # Enterprise loops) reach steady state before the next pod rotates.
+  minReadySeconds: 30
+  # Raise the k8s default (600s) so `helm upgrade --wait` doesn't trip
+  # ProgressDeadlineExceeded while a pod drains SSE within its grace period.
+  progressDeadlineSeconds: {{ .Values.progressDeadlineSeconds }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "mercure.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/configmap: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # Hash the Secret's inputs, not its render: generated JWT keys differ between renders.
+        checksum/secret: {{ pick .Values "existingSecret" "transportUrl" "publisherJwtKey" "subscriberJwtKey" "dev" "extraDirectives" "license" "caddyExtraConfig" "caddyExtraDirectives" | toJson | sha256sum }}
+      {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "mercure.labels" . | nindent 8 }}
+        # Component label must win over user podLabels: the NetworkPolicy
+        # podSelector relies on it. Safe post-install because the
+        # Deployment's immutable spec.selector doesn't reference it.
+        {{- $podLabels := merge (dict "app.kubernetes.io/component" "server") (.Values.podLabels | default dict) }}
+        {{- toYaml $podLabels | nindent 8 }}
+    spec:
+      {{- if eq .Values.updateStrategy.type "RollingUpdate" }}
+      # Lets the hub drain SSE at its own writeTimeout, or drain_timeout, before SIGKILL.
+      # Skipped under Recreate (e.g. BoltDB+persistence single-pod): the
+      # replacement Pod waits for full termination, so a long grace period
+      # would just extend downtime.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "mercure.serviceAccountName" . }}
+      # Set on the pod too so it holds when `serviceAccount.create=false`
+      # points at an existing SA with `automountServiceAccountToken: true`.
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      # Off because Mercure doesn't read service-discovery env vars; the
+      # default leaks every neighbour Service's host/port into the pod.
+      enableServiceLinks: false
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: SERVER_NAME
+              value: :{{ .Values.service.targetPort }}
+            - name: GLOBAL_OPTIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "mercure.fullname" . }}
+                  key: global-options
+            {{- if .Values.metrics.enabled }}
+            - name: CADDY_EXTRA_CONFIG_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mercure.secretName" . }}
+                  key: caddy-extra-config
+            # Dedicated metrics listener: the admin API must stay on localhost.
+            - name: CADDY_EXTRA_CONFIG
+              value: {{ printf "$(CADDY_EXTRA_CONFIG_SECRET)\n:%v {\n\tmetrics /metrics\n}" .Values.metrics.port | quote }}
+            {{- else }}
+            - name: CADDY_EXTRA_CONFIG
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mercure.secretName" . }}
+                  key: caddy-extra-config
+            {{- end }}
+            - name: CADDY_SERVER_EXTRA_DIRECTIVES
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mercure.secretName" . }}
+                  key: caddy-extra-directives
+            {{- if .Values.transportUrl }}
+            - name: MERCURE_TRANSPORT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mercure.secretName" . }}
+                  key: transport-url
+            {{- end }}
+            - name: MERCURE_PUBLISHER_JWT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mercure.secretName" . }}
+                  key: publisher-jwt-key
+            - name: MERCURE_PUBLISHER_JWT_ALG
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "mercure.fullname" . }}
+                  key: publisher-jwt-alg
+            - name: MERCURE_SUBSCRIBER_JWT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mercure.secretName" . }}
+                  key: subscriber-jwt-key
+            - name: MERCURE_SUBSCRIBER_JWT_ALG
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "mercure.fullname" . }}
+                  key: subscriber-jwt-alg
+            {{- $identity := include "mercure.identityDirectives" . | trim }}
+            {{- if $identity }}
+            - name: MERCURE_EXTRA_DIRECTIVES_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mercure.secretName" . }}
+                  key: extra-directives
+            - name: MERCURE_EXTRA_DIRECTIVES
+              value: {{ printf "%s\n$(MERCURE_EXTRA_DIRECTIVES_SECRET)" $identity | quote }}
+            {{- else }}
+            - name: MERCURE_EXTRA_DIRECTIVES
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mercure.secretName" . }}
+                  key: extra-directives
+            {{- end }}
+            - name: MERCURE_LICENSE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mercure.secretName" . }}
+                  key: license
+          {{- if .Values.extraEnvs }}
+            {{- toYaml .Values.extraEnvs | nindent 12 }}
+          {{- end }}
+          # /data, /config, /tmp are always mounted so the chart works under
+          # `readOnlyRootFilesystem: true` whatever the transport. Caddy writes
+          # its autosave config to /config (XDG_CONFIG_HOME) and its instance
+          # UUID + module data to /data (`caddy.AppDataDir()`); both must be
+          # writable for any module that uses storage (e.g. `rate_limit`).
+          # /data is the PVC when `persistence.enabled`, otherwise an emptyDir.
+          volumeMounts:
+            - mountPath: /data
+              name: mercure-data
+            - mountPath: /config
+              name: mercure-config
+            - mountPath: /tmp
+              name: mercure-tmp
+          {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            {{- if has .Values.service.portName (list "admin" "metrics" "http3") }}
+            {{- fail "service.portName must differ from admin, metrics and http3" }}
+            {{- end }}
+            - name: {{ .Values.service.portName }}
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+            {{- if include "mercure.http3" . }}
+            - name: http3
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: UDP
+            {{- end }}
+            - name: admin
+              containerPort: {{ .Values.adminPort }}
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            {{- if has (int .Values.metrics.port) (list (int .Values.adminPort) (int .Values.service.targetPort)) }}
+            {{- fail "metrics.port must differ from adminPort and service.targetPort" }}
+            {{- end }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.healthCheck.enabled }}
+          # Probes use wget (no curl in caddy:2-alpine) and 127.0.0.1 (not
+          # localhost): BusyBox wget prefers ::1, which Caddy's IPv4-only
+          # admin listener refuses.
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "--spider", "http://127.0.0.1:{{ .Values.adminPort }}/mercure/health/ready"]
+            initialDelaySeconds: {{ .Values.healthCheck.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthCheck.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthCheck.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthCheck.readiness.failureThreshold }}
+          livenessProbe:
+            exec:
+              command: ["wget", "-q", "--spider", "http://127.0.0.1:{{ .Values.adminPort }}/mercure/health/live"]
+            initialDelaySeconds: {{ .Values.healthCheck.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthCheck.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthCheck.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthCheck.liveness.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                # wget because caddy:2-alpine doesn't ship curl.
+                command: ["wget", "-q", "-O", "-", "--post-data=", "http://127.0.0.1:{{ .Values.adminPort }}/stop"]
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- tpl . $ | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: mercure-data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (include "mercure.fullname" .) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: mercure-config
+          emptyDir: {}
+        - name: mercure-tmp
+          emptyDir: {}
+      {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

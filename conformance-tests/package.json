@@ -1,0 +1,21 @@
+{
+  "name": "conformance-tests",
+  "version": "1.0.0",
+  "description": "Conformance test suite of the Mercure protocol",
+  "main": "index.js",
+  "scripts": {},
+  "keywords": [
+    "mercure",
+    "sse",
+    "testing",
+    "spec"
+  ],
+  "author": "Kévin Dunglas",
+  "license": "AGPL-3.0-or-later",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/node": "^25.6.2",
+    "dotenv": "^17.4.2"
+  }
+}

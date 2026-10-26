@@ -1,0 +1,112 @@
+package mercure
+
+import (
+	"context"
+	"sync"
+)
+
+// LocalTransport implements the TransportInterface without database and simply broadcast the live Updates.
+type LocalTransport struct {
+	sync.RWMutex
+
+	subscribers *SubscriberList
+	lastEventID string
+	closed      chan struct{}
+	closedOnce  sync.Once
+}
+
+// NewLocalTransport creates a new LocalTransport.
+func NewLocalTransport(sl *SubscriberList) *LocalTransport {
+	return &LocalTransport{
+		subscribers: sl,
+		closed:      make(chan struct{}),
+		lastEventID: EarliestLastEventID,
+	}
+}
+
+// Dispatch dispatches an update to all subscribers.
+func (t *LocalTransport) Dispatch(ctx context.Context, update *Update) error {
+	select {
+	case <-t.closed:
+		return ErrClosedTransport
+	default:
+	}
+
+	update.AssignUUID()
+
+	for _, s := range t.subscribers.MatchAny(update) {
+		s.Dispatch(ctx, update, false)
+	}
+
+	t.Lock()
+	t.lastEventID = update.ID
+	t.Unlock()
+
+	return nil
+}
+
+// AddSubscriber adds a new subscriber to the transport.
+func (t *LocalTransport) AddSubscriber(ctx context.Context, s *LocalSubscriber) error {
+	select {
+	case <-t.closed:
+		return ErrClosedTransport
+	default:
+	}
+
+	t.Lock()
+	defer t.Unlock()
+
+	t.subscribers.Add(s)
+
+	if s.RequestLastEventIDSet {
+		s.HistoryDispatched(EarliestLastEventID)
+	}
+
+	s.Ready(ctx)
+
+	return nil
+}
+
+// RemoveSubscriber removes a subscriber from the transport.
+func (t *LocalTransport) RemoveSubscriber(_ context.Context, s *LocalSubscriber) error {
+	select {
+	case <-t.closed:
+		return ErrClosedTransport
+	default:
+	}
+
+	t.Lock()
+	defer t.Unlock()
+
+	t.subscribers.Remove(s)
+
+	return nil
+}
+
+// GetSubscribers gets the list of active subscribers.
+func (t *LocalTransport) GetSubscribers(_ context.Context) (string, []*Subscriber, error) {
+	t.RLock()
+	defer t.RUnlock()
+
+	return t.lastEventID, getSubscribers(t.subscribers), nil
+}
+
+// Close closes the Transport.
+func (t *LocalTransport) Close(_ context.Context) (err error) {
+	t.closedOnce.Do(func() {
+		t.Lock()
+		defer t.Unlock()
+
+		close(t.closed)
+		t.subscribers.Walk(0, func(s *LocalSubscriber) bool {
+			s.Disconnect()
+
+			return true
+		})
+	})
+
+	return nil
+}
+
+// Interface guard.
+var _ Transport = (*LocalTransport)(nil)

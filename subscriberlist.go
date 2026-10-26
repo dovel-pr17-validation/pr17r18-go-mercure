@@ -1,0 +1,95 @@
+package mercure
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"slices"
+
+	"github.com/dunglas/skipfilter"
+)
+
+type SubscriberList struct {
+	skipfilter *skipfilter.SkipFilter[*LocalSubscriber, filterKey]
+}
+
+type filterKey [sha256.Size]byte
+
+// DefaultSubscriberListCacheSize is the default size of the skipfilter cache.
+//
+// Keys are fixed-size digests, so a full cache of 100,000 filters with no
+// subscribers uses about 25MB whatever the size of the update topics.
+const DefaultSubscriberListCacheSize = 100_000
+
+func NewSubscriberList(cacheSize int) *SubscriberList {
+	return &SubscriberList{skipfilter: skipfilter.New[*LocalSubscriber, filterKey](nil, cacheSize)}
+}
+
+// newFilterKey returns one digest per topic set and private flag; SHA-256 makes the collision that
+// would match an update against another topic set's subscribers computationally infeasible.
+func newFilterKey(topics []string, private bool) filterKey {
+	// Sort a copy: topics can be the Update's own Topics, read concurrently.
+	var sortedBuf [16]string
+
+	sorted := append(sortedBuf[:0], topics...)
+	slices.Sort(sorted)
+
+	h := sha256.New()
+
+	var buf [512]byte
+
+	input := buf[:1]
+	if private {
+		input[0] = 1
+	}
+
+	for _, t := range sorted {
+		if cap(input)-len(input) < binary.MaxVarintLen64 {
+			h.Write(input)
+			input = buf[:0]
+		}
+
+		// Length-prefixed so that topic boundaries are part of the hashed input.
+		input = binary.AppendUvarint(input, uint64(len(t)))
+		for len(t) > 0 {
+			n := copy(buf[len(input):], t)
+			input = buf[:len(input)+n]
+			t = t[n:]
+
+			if len(input) == len(buf) {
+				h.Write(input)
+				input = buf[:0]
+			}
+		}
+	}
+
+	h.Write(input)
+
+	var key filterKey
+	h.Sum(key[:0])
+
+	return key
+}
+
+func (sl *SubscriberList) MatchAny(u *Update) []*LocalSubscriber {
+	return sl.skipfilter.MatchFunc(newFilterKey(u.Topics, u.Private), func(s *LocalSubscriber) bool {
+		return s.MatchTopics(u.Topics, u.Private)
+	})
+}
+
+func (sl *SubscriberList) Walk(start uint64, callback func(s *LocalSubscriber) bool) uint64 {
+	return sl.skipfilter.Walk(start, func(val *LocalSubscriber) bool {
+		return callback(val)
+	})
+}
+
+func (sl *SubscriberList) Add(s *LocalSubscriber) {
+	sl.skipfilter.Add(s)
+}
+
+func (sl *SubscriberList) Remove(s *LocalSubscriber) {
+	sl.skipfilter.Remove(s)
+}
+
+func (sl *SubscriberList) Len() int {
+	return sl.skipfilter.Len()
+}

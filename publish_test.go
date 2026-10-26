@@ -1,0 +1,659 @@
+package mercure
+
+import (
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"testing/synctest"
+	"uuid"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPublish(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		hub := createDummy(t)
+
+		topics := []string{"https://example.com/books/1"}
+		s := NewLocalSubscriber("", slog.Default(), &TopicMatcherStore{})
+		s.setMatchers(stringsToExactMatchers(topics), stringsToExactMatchers(topics))
+
+		require.NoError(t, hub.transport.AddSubscriber(t.Context(), s))
+
+		go func() {
+			u, ok := <-s.Receive()
+
+			assert.True(t, ok)
+			assert.NotNil(t, u)
+			assert.Equal(t, "id", u.ID)
+			assert.Equal(t, s.SubscribedMatchers[0].Pattern, u.Topics[0])
+			assert.Equal(t, "Hello!", u.Data)
+			assert.True(t, u.Private)
+		}()
+
+		require.NoError(t, hub.Publish(t.Context(), &Update{
+			ID:      "id",
+			Data:    "Hello!",
+			Topics:  []string{s.SubscribedMatchers[0].Pattern},
+			Private: true,
+		}))
+
+		synctest.Wait()
+	})
+}
+
+func TestPublishHandlerNoAuthorizationHeader(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, nil)
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		_ = resp.Body.Close()
+	})
+
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, http.StatusText(http.StatusUnauthorized)+"\n", w.Body.String())
+}
+
+func TestPublishHandlerUnauthorizedJWT(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, nil)
+	req.Header.Add("Authorization", bearerPrefix+createDummyUnauthorizedJWT())
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, http.StatusText(http.StatusUnauthorized)+"\n", w.Body.String())
+}
+
+func TestPublishHandlerInvalidAlgJWT(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, nil)
+	req.Header.Add("Authorization", bearerPrefix+createDummyNoneSignedJWT())
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, http.StatusText(http.StatusUnauthorized)+"\n", w.Body.String())
+}
+
+func TestPublishHandlerBadContentType(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, nil)
+	req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"*"}))
+	req.Header.Add("Content-Type", "text/plain; boundary=")
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestPublishHandlerNoTopic(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, nil)
+	req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"*"}))
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, `Missing "topic" parameter
+`, w.Body.String())
+}
+
+func TestPublishHandlerInvalidRetry(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	form := url.Values{}
+	form.Add("topic", "https://example.com/books/1")
+	form.Add("data", "foo")
+	form.Add("retry", "invalid")
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"*"}))
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, `Invalid "retry" parameter
+`, w.Body.String())
+}
+
+func TestPublishHandlerNotAuthorizedTopicMatcher(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	form := url.Values{}
+	form.Add("topic", "https://example.com/books/1")
+	form.Add("data", "foo")
+	form.Add("private", "on")
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"foo"}))
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+func TestPublishHandlerEmptyTopicMatcher(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	form := url.Values{}
+	form.Add("topic", "https://example.com/books/1")
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{}))
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+func TestPublishHandlerLegacyAuthorization(t *testing.T) {
+	t.Parallel()
+
+	subscriberSignedByPublisher := mintAccessToken([]byte("publisher"), testResourceIdentifier, []authorizationDetail{{
+		Type:    authorizationDetailTypeMercure,
+		Actions: []mercureAction{actionSubscribe},
+		Topics:  stringsToDetailTopics([]string{"*"}),
+	}})
+
+	for _, tc := range []struct {
+		name    string
+		mode    int
+		token   string
+		private bool
+		status  int
+	}{
+		{"v7 no publish grant", 7, createDummyAuthorizedJWT(rolePublisher, nil), false, http.StatusForbidden},
+		{"v7 subscriber-only token", 7, subscriberSignedByPublisher, false, http.StatusForbidden},
+		// The exemption is reserved to legacy mercure.publish claims.
+		{"v7 other topic", 7, createDummyAuthorizedJWT(rolePublisher, []string{"https://example.com/other"}), false, http.StatusForbidden},
+		{"v7 private other topic", 7, createDummyAuthorizedJWT(rolePublisher, []string{"https://example.com/other"}), true, http.StatusForbidden},
+		{"v7 granted topic", 7, createDummyAuthorizedJWT(rolePublisher, []string{"https://example.com/books/1"}), true, http.StatusOK},
+		{"v7 wildcard", 7, createDummyAuthorizedJWT(rolePublisher, []string{"*"}), false, http.StatusOK},
+		{"v8 other topic", 8, createDummyAuthorizedJWT(rolePublisher, []string{"https://example.com/other"}), false, http.StatusForbidden},
+		{"modern other topic", 0, createDummyAuthorizedJWT(rolePublisher, []string{"https://example.com/other"}), false, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var opts []Option
+			if tc.mode != 0 {
+				opts = append(opts, WithProtocolVersionCompatibility(tc.mode))
+			}
+
+			assertPublishStatus(t, createDummy(t, opts...), tc.token, tc.private, tc.status)
+		})
+	}
+}
+
+func assertPublishStatus(t *testing.T, hub *Hub, token string, private bool, status int) {
+	t.Helper()
+
+	form := url.Values{"topic": {"https://example.com/books/1"}}
+	if private {
+		form.Set("private", "on")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Authorization", bearerPrefix+token)
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	assert.Equal(t, status, w.Code)
+
+	if status == http.StatusForbidden {
+		assert.Contains(t, w.Header().Get("WWW-Authenticate"), "insufficient_scope")
+	}
+}
+
+func TestPublishHandlerOK(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		hub := createDummy(t)
+
+		topics := []string{"https://example.com/books/1"}
+		s := NewLocalSubscriber("", slog.Default(), &TopicMatcherStore{})
+		s.setMatchers(stringsToExactMatchers(topics), stringsToExactMatchers(topics))
+
+		require.NoError(t, hub.transport.AddSubscriber(t.Context(), s))
+
+		go func() {
+			u, ok := <-s.Receive()
+			assert.True(t, ok)
+			assert.NotNil(t, u)
+			assert.Equal(t, "id", u.ID)
+			assert.Equal(t, s.SubscribedMatchers[0].Pattern, u.Topics[0])
+			assert.Equal(t, "Hello!", u.Data)
+			assert.True(t, u.Private)
+		}()
+
+		form := url.Values{}
+		form.Add("id", "id")
+		form.Add("topic", "https://example.com/books/1")
+		form.Add("data", "Hello!")
+		form.Add("private", "on")
+
+		req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, topics))
+
+		w := httptest.NewRecorder()
+		hub.PublishHandler(w, req)
+
+		resp := w.Result()
+
+		t.Cleanup(func() {
+			assert.NoError(t, resp.Body.Close())
+		})
+
+		body, _ := io.ReadAll(resp.Body)
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "text/plain; charset=utf-8", resp.Header.Get("Content-Type"))
+		assert.Equal(t, "id", string(body))
+
+		synctest.Wait()
+	})
+}
+
+func TestPublishHandlerNoData(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	form := url.Values{}
+	form.Add("topic", "https://example.com/books/1")
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"*"}))
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestPublishHandlerGenerateUUID(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		h := createDummy(t)
+
+		s := NewLocalSubscriber("", slog.Default(), &TopicMatcherStore{})
+		s.setMatchers(stringsToExactMatchers([]string{"https://example.com/books/1"}), nil)
+
+		require.NoError(t, h.transport.AddSubscriber(t.Context(), s))
+
+		go func() {
+			u := <-s.Receive()
+			assert.NotNil(t, u)
+
+			_, err := uuid.Parse(strings.TrimPrefix(u.ID, "urn:uuid:"))
+			assert.NoError(t, err)
+		}()
+
+		form := url.Values{}
+		form.Add("topic", "https://example.com/books/1")
+		form.Add("data", "Hello!")
+
+		req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"*"}))
+
+		w := httptest.NewRecorder()
+		h.PublishHandler(w, req)
+
+		resp := w.Result()
+
+		t.Cleanup(func() {
+			assert.NoError(t, resp.Body.Close())
+		})
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		body := string(bodyBytes)
+
+		_, err := uuid.Parse(strings.TrimPrefix(body, "urn:uuid:"))
+		require.NoError(t, err)
+
+		synctest.Wait()
+	})
+}
+
+func TestPublishHandlerWithErrorInTransport(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+	require.NoError(t, hub.transport.Close(t.Context()))
+
+	form := url.Values{}
+	form.Add("id", "id")
+	form.Add("topic", "https://example.com/books/1")
+	form.Add("data", "Hello!")
+	form.Add("private", "on")
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"foo", "https://example.com/books/1"}))
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	body, _ := io.ReadAll(resp.Body)
+
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	assert.Equal(t, "Internal Server Error\n", string(body))
+}
+
+func TestUpdateValidate(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		update Update
+		want   error
+	}{
+		{"valid", Update{ID: "id", Type: "type", Topics: []string{"https://example.com/books/1"}}, nil},
+		{"no topics", Update{}, ErrMissingTopic},
+		// An empty topic value resolves to the hub URL itself, which is reserved.
+		{"empty topic value", Update{Topics: []string{""}}, ErrReservedTopic},
+		{"reserved topic", Update{Topics: []string{"https://example.com/.well-known/mercure/subscriptions/foo"}}, ErrReservedTopic},
+		{"reserved topic relative", Update{Topics: []string{"mercure/subscriptions/foo"}}, ErrReservedTopic},
+		{"reserved topic absolute path", Update{Topics: []string{"/.well-known/mercure/subscriptions/foo"}}, ErrReservedTopic},
+		{"reserved topic exact", Update{Topics: []string{"https://example.com/.well-known/mercure"}}, ErrReservedTopic},
+		{"reserved topic percent-encoded", Update{Topics: []string{"https://example.com/.well-known/%6Dercure/subscriptions/foo"}}, ErrReservedTopic},
+		{"reserved topic backslashes", Update{Topics: []string{`https://example.com\.well-known\mercure\subscriptions\foo`}}, ErrReservedTopic},
+		{"reserved wildcard", Update{Topics: []string{"*"}}, ErrReservedWildcard},
+		{"non-reserved mid-path namespace", Update{Topics: []string{"https://example.com/foo/.well-known/mercure/bar"}}, nil},
+		{"non-reserved sibling path", Update{Topics: []string{"https://example.com/.well-known/mercure-dashboard"}}, nil},
+		{"non-reserved opaque topic", Update{Topics: []string{"urn:example:mercure"}}, nil},
+		{"id starts with #", Update{Topics: []string{"https://example.com/books/1"}, ID: "#42"}, ErrInvalidEventID},
+		{"id too long", Update{Topics: []string{"https://example.com/books/1"}, ID: strings.Repeat("a", maxEventIDLength+1)}, ErrInvalidEventID},
+		{"topic too long", Update{Topics: []string{"https://example.com/" + strings.Repeat("a", maxTopicLength)}}, ErrInvalidTopic},
+		{"id earliest", Update{Topics: []string{"https://example.com/books/1"}, ID: EarliestLastEventID}, ErrInvalidEventID},
+		{"topic NUL", Update{Topics: []string{"https://example.com/foo\x00bar"}}, ErrInvalidTopic},
+		{"topic C0", Update{Topics: []string{"https://example.com/foo\nbar"}}, ErrInvalidTopic},
+		{"topic invalid UTF-8", Update{Topics: []string{"https://example.com/\xff"}}, ErrInvalidTopic},
+		{"id LF", Update{Topics: []string{"https://example.com/books/1"}, ID: "foo\nevent: injected"}, ErrInvalidEventID},
+		{"id CR", Update{Topics: []string{"https://example.com/books/1"}, ID: "foo\rinjected"}, ErrInvalidEventID},
+		{"id NUL", Update{Topics: []string{"https://example.com/books/1"}, ID: "foo\x00bar"}, ErrInvalidEventID},
+		{"type LF", Update{Topics: []string{"https://example.com/books/1"}, Type: "foo\nid: injected"}, ErrInvalidEventType},
+		{"type CR", Update{Topics: []string{"https://example.com/books/1"}, Type: "foo\rinjected"}, ErrInvalidEventType},
+		{"type NUL", Update{Topics: []string{"https://example.com/books/1"}, Type: "foo\x00bar"}, ErrInvalidEventType},
+		{"type reserved mercure", Update{Topics: []string{"https://example.com/books/1"}, Type: reservedEventType}, ErrReservedEventType},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tc.update.Validate(urlPatternFallbackBase)
+			if tc.want == nil {
+				assert.NoError(t, err)
+
+				return
+			}
+
+			assert.ErrorIs(t, err, tc.want)
+		})
+	}
+}
+
+func TestUpdateValidateTooManyTopics(t *testing.T) {
+	t.Parallel()
+
+	topics := make([]string, maxPublishTopics+1)
+	for i := range topics {
+		topics[i] = "https://example.com/books/1"
+	}
+
+	err := testUpdate(&Update{}, topics...).Validate(urlPatternFallbackBase)
+	assert.ErrorIs(t, err, ErrTooManyTopics)
+}
+
+func TestPublishHandlerReservedTopicNamespace(t *testing.T) {
+	t.Parallel()
+
+	for _, topic := range []string{
+		"/.well-known/mercure/subscriptions/foo",
+		"https://example.com/.well-known/mercure/subscriptions/foo",
+		"mercure/subscriptions/foo", // relative, resolves into the namespace
+		"https://example.com/.well-known/%6Dercure/subscriptions/foo",
+	} {
+		t.Run(topic, func(t *testing.T) {
+			t.Parallel()
+
+			hub := createDummy(t)
+
+			form := url.Values{}
+			form.Add("topic", topic)
+			form.Add("data", "Hello!")
+
+			req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+			req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"*"}))
+
+			w := httptest.NewRecorder()
+			hub.PublishHandler(w, req)
+
+			resp := w.Result()
+
+			t.Cleanup(func() {
+				assert.NoError(t, resp.Body.Close())
+			})
+
+			// The reserved namespace is off-limits to every publisher
+			// regardless of grants, so it is a request-validation failure
+			// (400 invalid_request), not an authorization failure.
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		})
+	}
+}
+
+func TestPublishHandlerRejectsSSEControlChars(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		field string
+		value string
+	}{
+		{"id", "foo\nevent: injected"},
+		{"id", "foo\revent: injected"},
+		{"id", "foo\x00bar"},
+		{"type", "foo\nid: injected"},
+		{"type", "foo\rdata: injected"},
+		{"type", "foo\x00bar"},
+		// "mercure" is reserved for hub-generated events; a publisher using it
+		// must be rejected (exercises the PublishHandler ErrReservedEventType arm).
+		{"type", "mercure"},
+	}
+
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%s/%q", tc.field, tc.value), func(t *testing.T) {
+			t.Parallel()
+
+			hub := createDummy(t)
+
+			form := url.Values{}
+			form.Add("topic", "https://example.com/books/1")
+			form.Add(tc.field, tc.value)
+			form.Add("data", "Hello!")
+
+			req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+			req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"*"}))
+
+			w := httptest.NewRecorder()
+			hub.PublishHandler(w, req)
+
+			resp := w.Result()
+
+			t.Cleanup(func() {
+				assert.NoError(t, resp.Body.Close())
+			})
+
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		})
+	}
+}
+
+func TestPublishHandlerTooManyTopics(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	form := url.Values{}
+	for i := 0; i <= maxPublishTopics; i++ {
+		form.Add("topic", "https://example.com/books/1")
+	}
+
+	form.Add("data", "Hello!")
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"*"}))
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestPublishHandlerTooManyClaimMatchers(t *testing.T) {
+	t.Parallel()
+
+	hub := createDummy(t)
+
+	scope := make([]string, maxClaimMatchers+1)
+	for i := range scope {
+		scope[i] = "https://example.com/books/1"
+	}
+
+	form := url.Values{}
+	form.Add("topic", "https://example.com/books/1")
+	form.Add("data", "Hello!")
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, scope))
+
+	w := httptest.NewRecorder()
+	hub.PublishHandler(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	// Too many topics in a single authorization detail → invalid_token.
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}

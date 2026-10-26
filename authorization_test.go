@@ -1,0 +1,570 @@
+//go:build !deprecated_claim
+
+package mercure
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// signSubscriberToken signs claims with the dummy subscriber key.
+func signSubscriberToken(tb testing.TB, c *claims) string {
+	tb.Helper()
+
+	token := jwt.New(jwt.SigningMethodHS256)
+	token.Header["typ"] = atJWTType
+	token.Claims = c
+
+	s, err := token.SignedString([]byte("subscriber"))
+	require.NoError(tb, err)
+
+	return s
+}
+
+func subscriberRegisteredClaims() jwt.RegisteredClaims {
+	return jwt.RegisteredClaims{
+		Issuer:    testIssuer,
+		Audience:  jwt.ClaimStrings{testResourceIdentifier},
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}
+}
+
+func TestAuthorizeMultipleAuthorizationHeader(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+"x")
+	r.Header.Add("Authorization", bearerPrefix+"y")
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.ErrorIs(t, err, ErrInvalidAuthorizationHeader)
+	require.Nil(t, claims)
+}
+
+func TestAuthorizeAuthorizationHeaderTooShort(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", "Bearer x")
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.ErrorIs(t, err, ErrInvalidAuthorizationHeader)
+	require.Nil(t, claims)
+}
+
+func TestAuthorizeAuthorizationHeaderNoBearer(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", "Greater "+createDummyAuthorizedJWT(roleSubscriber, nil))
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.ErrorIs(t, err, ErrInvalidAuthorizationHeader)
+	require.Nil(t, claims)
+}
+
+func TestAuthorizeAuthorizationHeaderInvalidAlg(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+createDummyNoneSignedJWT())
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.Error(t, err)
+	require.Nil(t, claims)
+}
+
+func TestAuthorizeAuthorizationHeaderInvalidSignature(t *testing.T) {
+	t.Parallel()
+
+	valid := createDummyAuthorizedJWT(roleSubscriber, []string{"foo"})
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+valid[:len(valid)-8]+"12345678")
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.Error(t, err)
+	require.Nil(t, claims)
+}
+
+func TestAuthorizeAuthorizationHeader(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(roleSubscriber, []string{"foo", "bar"}))
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.NoError(t, err)
+	assert.True(t, claims.authz.grants(h.topicMatcherStore, actionSubscribe, "foo"))
+	assert.True(t, claims.authz.grants(h.topicMatcherStore, actionSubscribe, "bar"))
+	assert.False(t, claims.authz.grants(h.topicMatcherStore, actionSubscribe, "baz"))
+}
+
+func TestAuthorizeAuthorizationHeaderLowercaseScheme(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	// The auth scheme is case-insensitive (RFC 9110 §11.1).
+	r.Header.Add("Authorization", "bearer "+createDummyAuthorizedJWT(roleSubscriber, []string{"foo"}))
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.NoError(t, err)
+	assert.True(t, claims.authz.grants(h.topicMatcherStore, actionSubscribe, "foo"))
+}
+
+// The RFC 6750 "access_token" query parameter is not a supported mechanism
+// (RFC 9700 §4.3.2): a valid token passed this way falls through to anonymous.
+func TestAuthorizeAccessTokenQueryIgnored(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	query := r.URL.Query()
+	query.Set("access_token", createDummyAuthorizedJWT(roleSubscriber, []string{"foo"}))
+	r.URL.RawQuery = query.Encode()
+
+	h := createAnonymousDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.NoError(t, err)
+	require.Nil(t, claims)
+}
+
+// The deprecated "authorization" query parameter is ignored in modern mode,
+// falling through to anonymous access.
+func TestAuthorizeLegacyQueryParamIgnored(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	query := r.URL.Query()
+	query.Set("authorization", createDummyAuthorizedJWT(roleSubscriber, []string{"foo"}))
+	r.URL.RawQuery = query.Encode()
+
+	h := createAnonymousDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.NoError(t, err)
+	require.Nil(t, claims)
+}
+
+func TestAuthorizeCookie(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: createDummyAuthorizedJWT(roleSubscriber, []string{"foo"})})
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.NoError(t, err)
+	assert.True(t, claims.authz.grants(h.topicMatcherStore, actionSubscribe, "foo"))
+}
+
+// A modern hub does not honor the pre-1.0 "mercureAuthorization" cookie name,
+// so a client still using it is treated as anonymous.
+func TestAuthorizeLegacyCookieNameIgnored(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.AddCookie(&http.Cookie{Name: "mercureAuthorization", Value: createDummyAuthorizedJWT(roleSubscriber, []string{"foo"})})
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.NoError(t, err)
+	require.Nil(t, claims)
+}
+
+func TestAuthorizeCookieNoOriginNoReferer(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
+	r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: createDummyAuthorizedJWT(rolePublisher, []string{"foo"})})
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, true)
+	require.ErrorIs(t, err, ErrNoOrigin)
+	require.Nil(t, claims)
+}
+
+func TestAuthorizeCookieOriginNotAllowed(t *testing.T) {
+	t.Parallel()
+
+	r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
+	r.Header.Add("Origin", "https://example.com")
+	r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: createDummyAuthorizedJWT(rolePublisher, []string{"foo"})})
+
+	h := createDummy(t, WithPublishOrigins([]string{"https://example.net"}))
+
+	claims, err := h.authorize(r, true)
+	require.ErrorIs(t, err, ErrOriginNotAllowed)
+	require.Nil(t, claims)
+}
+
+// RFC 9068: a token whose typ header is not at+jwt is rejected in modern mode.
+func TestAuthorizeRejectsNonAccessToken(t *testing.T) {
+	t.Parallel()
+
+	token := jwt.New(jwt.SigningMethodHS256) // default typ "JWT"
+	token.Claims = &claims{
+		RegisteredClaims:     subscriberRegisteredClaims(),
+		AuthorizationDetails: subscribeDetailsFromMatchers(nil, TopicMatcher{Type: MatcherTypeExact, Pattern: "foo"}),
+	}
+	s, err := token.SignedString([]byte("subscriber"))
+	require.NoError(t, err)
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+s)
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.ErrorIs(t, err, ErrInvalidJWT)
+	require.Nil(t, claims)
+}
+
+// RFC 9068 media types are case-insensitive, including the optional
+// "application/" prefix.
+func TestAuthorizeAcceptsMixedCaseATJWTType(t *testing.T) {
+	t.Parallel()
+
+	for _, typ := range []string{"at+jwt", "AT+JWT", "application/at+jwt", "Application/AT+JWT"} {
+		token := jwt.New(jwt.SigningMethodHS256)
+		token.Header["typ"] = typ
+		token.Claims = &claims{
+			RegisteredClaims:     subscriberRegisteredClaims(),
+			AuthorizationDetails: subscribeDetailsFromMatchers(nil, TopicMatcher{Type: MatcherTypeExact, Pattern: "foo"}),
+		}
+
+		s, err := token.SignedString([]byte("subscriber"))
+		require.NoError(t, err)
+
+		r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+		r.Header.Add("Authorization", bearerPrefix+s)
+
+		h := createDummy(t)
+
+		c, err := h.authorize(r, false)
+		require.NoError(t, err, typ)
+		require.NotNil(t, c, typ)
+	}
+}
+
+func TestAuthorizeRejectsWrongAudience(t *testing.T) {
+	t.Parallel()
+
+	c := &claims{
+		Audience:             jwt.ClaimStrings{"https://other.example.com/.well-known/mercure"},
+		ExpiresAt:            jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		AuthorizationDetails: subscribeDetailsFromMatchers(nil, TopicMatcher{Type: MatcherTypeExact, Pattern: "foo"}),
+	}
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+signSubscriberToken(t, c))
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.Error(t, err)
+	require.Nil(t, claims)
+}
+
+func TestAuthorizeRejectsMissingAudience(t *testing.T) {
+	t.Parallel()
+
+	c := &claims{
+		ExpiresAt:            jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		AuthorizationDetails: subscribeDetailsFromMatchers(nil, TopicMatcher{Type: MatcherTypeExact, Pattern: "foo"}),
+	}
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+signSubscriberToken(t, c))
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.Error(t, err)
+	require.Nil(t, claims)
+}
+
+func TestAuthorizeRejectsMissingExpiration(t *testing.T) {
+	t.Parallel()
+
+	c := &claims{
+		Audience:             jwt.ClaimStrings{testResourceIdentifier},
+		AuthorizationDetails: subscribeDetailsFromMatchers(nil, TopicMatcher{Type: MatcherTypeExact, Pattern: "foo"}),
+	}
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+signSubscriberToken(t, c))
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.Error(t, err)
+	require.Nil(t, claims)
+}
+
+// A token carrying a malformed authorization_details claim is rejected.
+func TestAuthorizeRejectsInvalidAuthorizationDetails(t *testing.T) {
+	t.Parallel()
+
+	c := &claims{
+		RegisteredClaims: subscriberRegisteredClaims(),
+		AuthorizationDetails: []authorizationDetail{{
+			Type:    authorizationDetailTypeMercure,
+			Actions: []mercureAction{actionSubscribe},
+			// No topics: invalid.
+		}},
+	}
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+signSubscriberToken(t, c))
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.ErrorIs(t, err, errInvalidAuthorizationDetail)
+	require.Nil(t, claims)
+}
+
+// A topic matcher carrying a control character is rejected, like the query and
+// publish paths, so attacker-shaped patterns cannot reach the match cache.
+func TestAuthorizeRejectsControlCharInAuthorizationDetail(t *testing.T) {
+	t.Parallel()
+
+	c := &claims{
+		RegisteredClaims:     subscriberRegisteredClaims(),
+		AuthorizationDetails: subscribeDetailsFromMatchers(nil, TopicMatcher{Type: MatcherTypeExact, Pattern: "foo\x00bar"}),
+	}
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+signSubscriberToken(t, c))
+
+	h := createDummy(t)
+
+	claims, err := h.authorize(r, false)
+	require.ErrorIs(t, err, errInvalidAuthorizationDetail)
+	require.Nil(t, claims)
+}
+
+// When the hub advertises authorization servers, a token whose issuer is not
+// one of them is rejected even if its signature, audience and expiration are
+// valid (RFC 9068 §4).
+func TestAuthorizeRejectsUntrustedIssuer(t *testing.T) {
+	t.Parallel()
+
+	rc := subscriberRegisteredClaims()
+	rc.Issuer = "https://evil.example.com"
+	c := &claims{
+		RegisteredClaims:     rc,
+		AuthorizationDetails: subscribeDetailsFromMatchers(nil, TopicMatcher{Type: MatcherTypeExact, Pattern: "foo"}),
+	}
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+signSubscriberToken(t, c))
+
+	h := createDummy(t, WithIssuers([]Issuer{{Identifier: "https://auth.example.com", AuthorizationServer: true, Subscriber: Static{Key: []byte("subscriber"), Algorithm: "HS256"}}}))
+
+	claims, err := h.authorize(r, false)
+	require.ErrorIs(t, err, ErrInvalidJWT)
+	require.Nil(t, claims)
+}
+
+// A token issued by one of the advertised authorization servers is accepted.
+func TestAuthorizeAcceptsTrustedIssuer(t *testing.T) {
+	t.Parallel()
+
+	rc := subscriberRegisteredClaims()
+	rc.Issuer = "https://auth.example.com"
+	c := &claims{
+		RegisteredClaims:     rc,
+		AuthorizationDetails: subscribeDetailsFromMatchers(nil, TopicMatcher{Type: MatcherTypeExact, Pattern: "foo"}),
+	}
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+signSubscriberToken(t, c))
+
+	h := createDummy(t, WithIssuers([]Issuer{{Identifier: "https://auth.example.com", AuthorizationServer: true, Subscriber: Static{Key: []byte("subscriber"), Algorithm: "HS256"}}}))
+
+	claims, err := h.authorize(r, false)
+	require.NoError(t, err)
+	require.True(t, claims.authz.grants(h.topicMatcherStore, actionSubscribe, "foo"))
+}
+
+// signTokenHS256 signs a subscribe token for the given issuer with the given
+// HMAC key.
+func signTokenHS256(tb testing.TB, key []byte, issuer string) string {
+	tb.Helper()
+
+	token := jwt.New(jwt.SigningMethodHS256)
+	token.Header["typ"] = atJWTType
+	token.Claims = &claims{
+		Issuer:               issuer,
+		Audience:             jwt.ClaimStrings{testResourceIdentifier},
+		ExpiresAt:            jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		AuthorizationDetails: subscribeDetailsFromMatchers(nil, TopicMatcher{Type: MatcherTypeExact, Pattern: "foo"}),
+	}
+
+	s, err := token.SignedString(key)
+	require.NoError(tb, err)
+
+	return s
+}
+
+// TestMultiIssuerVerification binds two issuers to distinct keys and checks
+// that each token is verified only with the key of its own issuer (#1302).
+func TestMultiIssuerVerification(t *testing.T) {
+	t.Parallel()
+
+	const issuerA, issuerB = "https://a.example", "https://b.example"
+
+	keyA, keyB := []byte("key-a"), []byte("key-b")
+
+	tms, err := NewTopicMatcherStore(0)
+	require.NoError(t, err)
+
+	h, err := NewHub(t.Context(),
+		WithResourceIdentifier(testResourceIdentifier),
+		WithTopicMatcherStore(tms),
+		WithIssuers([]Issuer{
+			{Identifier: issuerA, Subscriber: Static{Key: keyA, Algorithm: "HS256"}},
+			{Identifier: issuerB, Subscriber: Static{Key: keyB, Algorithm: "HS256"}},
+		}),
+	)
+	require.NoError(t, err)
+
+	for name, tc := range map[string]struct {
+		key     []byte
+		issuer  string
+		wantErr bool
+	}{
+		"issuer A, signature A": {keyA, issuerA, false},
+		"issuer B, signature B": {keyB, issuerB, false},
+		"issuer A, signature B": {keyB, issuerA, true},
+		"issuer B, signature A": {keyA, issuerB, true},
+		"unknown issuer":        {keyA, "https://c.example", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+			r.Header.Add("Authorization", bearerPrefix+signTokenHS256(t, tc.key, tc.issuer))
+
+			claims, err := h.authorize(r, false)
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrInvalidJWT)
+				require.Nil(t, claims)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.True(t, claims.authz.grants(h.topicMatcherStore, actionSubscribe, "foo"))
+		})
+	}
+}
+
+// A role with no verifier for an issuer rejects that role's tokens even when
+// the signature is valid.
+func TestMultiIssuerRoleWithoutVerifier(t *testing.T) {
+	t.Parallel()
+
+	const issuer = "https://a.example"
+
+	key := []byte("key-a")
+
+	tms, err := NewTopicMatcherStore(0)
+	require.NoError(t, err)
+
+	h, err := NewHub(t.Context(),
+		WithResourceIdentifier(testResourceIdentifier),
+		WithTopicMatcherStore(tms),
+		WithIssuers([]Issuer{{Identifier: issuer, Subscriber: Static{Key: key, Algorithm: "HS256"}}}),
+	)
+	require.NoError(t, err)
+
+	r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+signTokenHS256(t, key, issuer))
+
+	// The issuer has no publisher verifier: a publish token is rejected.
+	claims, err := h.authorize(r, true)
+	require.ErrorIs(t, err, ErrInvalidJWT)
+	require.Nil(t, claims)
+}
+
+// Without legacy claims compiled in, compatibility mode relaxes nothing about
+// tokens, so a token minted for another hub sharing the key is refused.
+func TestCompatModeWithoutLegacyClaimsChecksAudience(t *testing.T) {
+	t.Parallel()
+
+	h := createDummy(t, WithProtocolVersionCompatibility(8))
+
+	for audience, accepted := range map[string]bool{
+		testResourceIdentifier:                      true,
+		"https://other.example/.well-known/mercure": false,
+	} {
+		r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+		r.Header.Add("Authorization", bearerPrefix+mintAccessToken([]byte("subscriber"), audience, nil))
+
+		_, err := h.authorize(r, false)
+		if accepted {
+			require.NoError(t, err, audience)
+		} else {
+			require.ErrorIs(t, err, ErrInvalidJWT, audience)
+		}
+	}
+}
+
+// Oversized tokens are rejected before parsing, even when validly signed.
+func TestAuthorizeRejectsOversizedToken(t *testing.T) {
+	t.Parallel()
+
+	rc := subscriberRegisteredClaims()
+	rc.ID = strings.Repeat("a", maxCompactJWSLen)
+	token := signSubscriberToken(t, &claims{RegisteredClaims: rc})
+	require.Greater(t, len(token), maxCompactJWSLen)
+
+	h := createDummy(t)
+
+	r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+token)
+
+	_, err := h.authorize(r, false)
+	require.ErrorIs(t, err, ErrInvalidJWT)
+	require.ErrorContains(t, err, "exceeds")
+
+	r, _ = http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: token})
+
+	_, err = h.authorize(r, false)
+	require.ErrorIs(t, err, ErrInvalidJWT)
+	require.ErrorContains(t, err, "exceeds")
+
+	rc.ID = strings.Repeat("a", maxCompactJWSLen/2)
+	r, _ = http.NewRequest(http.MethodGet, defaultHubURL, nil)
+	r.Header.Add("Authorization", bearerPrefix+signSubscriberToken(t, &claims{RegisteredClaims: rc}))
+
+	_, err = h.authorize(r, false)
+	require.NoError(t, err)
+}

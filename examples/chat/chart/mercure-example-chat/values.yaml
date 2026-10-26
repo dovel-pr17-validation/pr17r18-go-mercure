@@ -1,0 +1,146 @@
+# Default values for mercure-example-chat.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: dunglas/mercure-example-chat
+  pullPolicy: Always
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: latest
+
+hubUrl: https://demo.mercure.rocks/.well-known/mercure
+cookieDomain: .mercure.rocks
+jwtKey: "!ChangeThisMercureHubJWTSecretKey!"
+messageUriTemplate: https://chat.example.com/messages/{id}
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # The pod doesn't talk to the Kubernetes API.
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# Pod-wide hardening: matches the nonroot user baked into the image.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container hardening: gunicorn needs no caps, rootfs is read-only.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  # Service port; the container itself binds to .Values.containerPort.
+  port: 80
+
+# Container port gunicorn binds to. Unprivileged so the non-root user can listen.
+containerPort: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+
+# Gateway API HTTPRoute alternative to Ingress. Enable one or the other
+# (or both, for migrations). The referenced Gateway must already exist.
+httpRoute:
+  enabled: false
+  annotations: {}
+  parentRefs: []
+  #  - name: my-gateway
+  #    namespace: gateway-system
+  #    sectionName: https
+  hostnames: []
+  #  - chat.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+
+# No CPU limit on purpose: CFS quota throttling on production clusters
+# causes probe timeouts and latency spikes even with idle CPU.
+resources:
+  limits:
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 96Mi
+
+# TCP probes for startup/liveness, HTTP for readiness with a 5s timeout.
+startupProbe:
+  tcpSocket:
+    port: http
+  failureThreshold: 30
+  periodSeconds: 2
+livenessProbe:
+  tcpSocket:
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 2
+readinessProbe:
+  httpGet:
+    path: /
+    port: http
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 4
+
+# NetworkPolicy: ingress is allowed from the configured ingress controller
+# namespace and from the release namespace itself (so `helm test` and other
+# in-namespace callers keep working); egress is allowed to DNS plus
+# everything outside the cluster CIDR (the demo calls the public Mercure
+# hub). Namespaces are matched via the kubernetes.io/metadata.name
+# auto-label (always present on K8s 1.22+).
+networkPolicy:
+  enabled: true
+  ingressNamespace: ingress-nginx
+  dnsNamespace: kube-system
+  # Pod + service CIDRs blocked on egress so traffic to other namespaces
+  # is denied. Defaults match the DigitalOcean managed cluster; adjust as
+  # needed for your environment.
+  clusterCIDRs:
+    - 10.244.0.0/16
+    - 10.245.0.0/16
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+
+# /tmp must be writable for gunicorn worker heartbeats since rootfs is read-only.
+volumes:
+  - name: tmp
+    emptyDir: {}
+volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

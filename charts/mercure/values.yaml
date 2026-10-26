@@ -1,0 +1,463 @@
+# Default values for mercure.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# -- Inject global options in the Caddyfile.
+globalOptions: ""
+# -- Inject snippet or named-routes options in the Caddyfile
+caddyExtraConfig: ""
+# -- Enable development mode: injects the insecure `playground` directive (debug UI, demo endpoints, anonymous subscriptions, permissive CORS). Never enable in production.
+dev: false
+# -- Deprecated: The URL representation of the transport to use.
+transportUrl: ""
+# -- Inject extra Mercure directives in the Caddyfile.
+extraDirectives: ""
+# -- Inject extra Caddy directives in the Caddyfile.
+caddyExtraDirectives: ""
+
+# -- Pin the OAuth 2.0 resource identifier (the `aud` access tokens must carry), e.g. `https://hub.example.com/.well-known/mercure`.
+# If empty, the hub derives it from each request's origin, which is `http://` behind a TLS-terminating ingress or gateway.
+resourceIdentifier: ""
+# -- Origins the hub answers on (`public_urls`), others get `421 Misdirected Request`.
+# Set it (or `resourceIdentifier`) when clients can reach the pod under any Host, for instance several hubs trusting one issuer.
+# Origins are matched as the pod sees them: `http://` behind a TLS-terminating ingress or gateway.
+publicUrls: []  # @schema item:string
+
+# -- The JWT key to use for publishers. If empty, a random key is generated on install and kept on upgrades
+# (renderers without cluster access, such as `helm template`, generate a new one each time: set it or use `existingSecret`).
+publisherJwtKey: ""
+# -- The JWT algorithm to use for publishers.
+publisherJwtAlg: HS256
+
+# -- The JWT key to use for subscribers. Generated and kept like `publisherJwtKey` if empty.
+subscriberJwtKey: ""
+# -- The JWT algorithm to use for subscribers.
+subscriberJwtAlg: HS256
+
+# -- Additional environment variables to set
+extraEnvs: []
+# extraEnvs:
+#   - name: FOO
+#     valueFrom:
+#       secretKeyRef:
+#         key: FOO
+#         name: secret-resource
+
+# -- Allows to pass an existing secret name, the above values will be used if empty.
+existingSecret: ""
+# These keys must exist in the provided secret:
+# -  publisher-jwt-key
+# -  subscriber-jwt-key
+# -  extra-directives:
+# -  license:
+# -  caddy-extra-directives:
+
+# -- The license key for [the High Availability version](https://mercure.rocks/docs/hub/cluster) (not necessary if you use the FOSS version).
+license: ""
+
+# -- Port used for the Caddy admin API (health checks, graceful shutdown). The admin API only listens on localhost.
+adminPort: 2019  # @schema minimum:1;maximum:65535
+
+# -- Transport-aware health checks exposed via the Caddy admin API.
+# When enabled, readiness and liveness probes use /mercure/health/ready and /mercure/health/live
+# on the admin port. When disabled, the pod has no probes.
+healthCheck:
+  # -- Enable transport-aware health checks.
+  enabled: true
+  readiness:
+    initialDelaySeconds: 5  # @schema minimum:0
+    periodSeconds: 5  # @schema minimum:1
+    timeoutSeconds: 3  # @schema minimum:1
+    failureThreshold: 2  # @schema minimum:1
+  liveness:
+    initialDelaySeconds: 15  # @schema minimum:0
+    periodSeconds: 10  # @schema minimum:1
+    timeoutSeconds: 5  # @schema minimum:1
+    failureThreshold: 3  # @schema minimum:1
+
+metrics:
+  # -- Serve Prometheus metrics at `/metrics` on a dedicated listener. For Caddy's HTTP metrics, also enable the [`metrics` global option](https://caddyserver.com/docs/caddyfile/options#metrics) in `globalOptions`.
+  enabled: false
+  # -- Port of the metrics listener, must differ from `adminPort` and `service.targetPort`.
+  port: 9180  # @schema minimum:1;maximum:65535
+
+  serviceMonitor:
+    # -- Whether to create a ServiceMonitor for Prometheus Operator.
+    enabled: false
+    # -- The interval to use for the ServiceMonitor to scrape the metrics.
+    interval: 15s
+    # -- Timeout after which the scrape is ended
+    scrapeTimeout: ""
+    # -- Additional labels that can be used so ServiceMonitor will be discovered by Prometheus
+    selector: {}
+    # -- RelabelConfigs to apply to samples before ingestion (sample relabeling).
+    metricRelabelings: []
+    # -- RelabelConfigs to apply to samples before scraping (target relabeling).
+    relabelings: []
+    # -- Specify honorLabels parameter to add the scrape endpoint
+    honorLabels: false
+
+# -- The number of replicas (pods) to launch, must be 1 unless you are using [the High Availability version](https://mercure.rocks/docs/hub/cluster).
+replicaCount: 1  # @schema minimum:1
+
+# -- [Deployment strategy type](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#strategy).
+# Useful to set it to 'Recreate' when using BoltDB transport with persistence.
+updateStrategy:
+  type: RollingUpdate  # @schema enum:[RollingUpdate, Recreate]
+
+# -- Pod terminationGracePeriodSeconds. Must be >= `write_timeout`, or
+# `shutdown_delay` + `drain_timeout` when `drain_timeout` is set (via
+# `extraDirectives`), so SSE subscribers drain before k8s SIGKILLs the pod.
+# Default = Mercure's `DefaultWriteTimeout` (600s) + 60s margin.
+# Only applied with `RollingUpdate`; `Recreate` keeps the k8s default (30s)
+# to minimize the gap between old pod gone and new pod ready.
+terminationGracePeriodSeconds: 660  # @schema minimum:0
+
+# -- Deployment `spec.progressDeadlineSeconds`. A rolling update can spend
+# up to `terminationGracePeriodSeconds` per pod draining SSE, so the k8s
+# default (600s) trips `ProgressDeadlineExceeded` on healthy rollouts.
+# Default fits a 2-pod rollout; scale up for larger `replicaCount`
+# (roughly `replicaCount × (terminationGracePeriodSeconds + minReadySeconds)`
+# plus a margin). Only applied with `RollingUpdate`.
+progressDeadlineSeconds: 1800  # @schema minimum:0
+
+image:
+  # -- Name of the image repository to pull the container image from.
+  repository: dunglas/mercure
+  # -- [Image pull policy](https://kubernetes.io/docs/concepts/containers/images/#updating-images) for updating already existing images on a node.
+  pullPolicy: IfNotPresent  # @schema enum:[Always, IfNotPresent, Never]
+  # -- Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+# -- Reference to one or more secrets to be used when [pulling images](https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/#create-a-pod-that-uses-your-secret) (from private registries).
+imagePullSecrets: []
+# -- A name in place of the chart name for `app:` labels.
+nameOverride: ""
+# -- A name to substitute for the full names of resources.
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Specifies whether a service account should be created.
+  create: true
+  # -- Automatically mount a ServiceAccount's API credentials in hub pods.
+  # Defaults to false: Mercure does not call the Kubernetes API, so the
+  # token is unused attack surface. Enable for sidecars or modules that
+  # need the in-pod token.
+  automount: false
+  # -- Annotations to add to the service account.
+  annotations: {}
+  # -- The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template.
+  name: ""
+
+# -- Annotations to be added to pods.
+podAnnotations: {}
+
+# -- Extra labels to be added to pods.
+podLabels: {}
+
+# -- Pod [security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-pod).
+# Defaults target the [restricted PodSecurity Standard](https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted).
+# `fsGroup` makes the chart's writable volumes (/data, /config, /tmp) group-writable
+# by the rootless container; `OnRootMismatch` skips re-chowning PVCs on every restart.
+# Override with `{}` if your cluster forbids these fields.
+podSecurityContext:
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container [security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-container).
+# Defaults satisfy the [restricted PodSecurity Standard](https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted):
+# rootless UID/GID 1000, no caps, no privilege escalation, read-only rootfs.
+# Binding to :80 relies on `net.ipv4.ip_unprivileged_port_start=0`, set by
+# containerd 1.5+ and cri-o. On older runtimes, set `service.targetPort` to
+# an unprivileged port (e.g. `8080`). Override with `{}` to opt out.
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+
+deployment:
+  # -- Annotations to be added to the deployment.
+  annotations: {}
+
+service:
+  # -- Kubernetes [service type](https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types).
+  type: ClusterIP  # @schema enum:[ClusterIP, NodePort, LoadBalancer, ExternalName]
+  # -- Service port.
+  port: 80  # @schema minimum:1;maximum:65535
+  # -- Service target port.
+  targetPort: 80  # @schema type:[integer, string];minimum:1;maximum:65535
+  # -- Set this, to pin the external nodePort in case `service.type` is `NodePort`.
+  nodePort:  # @schema type:[integer, null];minimum:1;maximum:65535
+  # -- Service and container port name. `https` or an `https-` prefix marks the port as serving TLS.
+  portName: http  # @schema pattern:^[a-z0-9]([a-z0-9-]*[a-z0-9])?$;maxLength:15
+  # -- Also expose the port over UDP for HTTP/3 when it serves TLS. Disable if your load balancer can't mix TCP and UDP.
+  http3: true
+  # -- Annotations to be added to the service.
+  annotations: {}
+
+metricsService:
+  # -- (object) Annotations to be added to the metrics service. Set `{}` for none.
+  # @default -- `service.annotations`
+  annotations:  # @schema type:[object, null]
+
+ingress:
+  # -- Enable [ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/).
+  enabled: false
+  # -- Ingress [class name](https://kubernetes.io/docs/concepts/services-networking/ingress/#ingress-class).
+  className: ""
+  # -- Annotations to be added to the ingress.
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  # -- Ingress host configuration.
+  # @default -- See [values.yaml](values.yaml).
+  hosts:
+    - host: mercure-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  # -- Ingress TLS configuration.
+  # @default -- See [values.yaml](values.yaml).
+  tls: []
+  #  - secretName: mercure-example-tls
+  #    hosts:
+  #      - mercure-example.local
+
+# -- Expose the service via gateway-api HTTPRoute
+# Requires Gateway API resources and suitable controller installed within the cluster
+# (see: https://gateway-api.sigs.k8s.io/guides/)
+httpRoute:
+  # -- HTTPRoute enabled.
+  enabled: false
+  # -- HTTPRoute annotations.
+  annotations: {}
+  # -- Which Gateways this Route is attached to.
+  parentRefs:
+    - name: gateway
+      sectionName: http
+      # namespace: default
+  # -- Hostnames matching HTTP header.
+  hostnames:
+    - mercure-example.local
+  # -- List of rules and filters applied. When empty, a default rule
+  # routes all traffic with `timeouts.request: 0s` so long-lived SSE
+  # subscriptions aren't cut by the gateway (Envoy defaults to 15s).
+  # Mercure's own `write_timeout` (600s) drives subscriber rotation.
+  # @default -- See [values.yaml](values.yaml).
+  rules: []
+  # rules:
+  #   - matches:
+  #       - path:
+  #           type: PathPrefix
+  #           value: /headers
+  #     filters:
+  #       - type: RequestHeaderModifier
+  #         requestHeaderModifier:
+  #           set:
+  #             - name: My-Overwrite-Header
+  #               value: this-is-the-only-value
+  #           remove:
+  #             - User-Agent
+  #   - matches:
+  #       - path:
+  #           type: PathPrefix
+  #           value: /echo
+  #         headers:
+  #           - name: version
+  #             value: v2
+  #   - matches:
+  #       - path:
+  #           type: PathPrefix
+  #           value: /.well-known/mercure
+  #         method: POST
+  #     # Supplying `rules` opts out of the auto-default. Use
+  #     # `timeouts` to bound a specific path: for instance, cap
+  #     # publish POSTs so a slow publisher can't hold a gateway
+  #     # connection open. SSE-serving rules should keep
+  #     # `request: 0s` to avoid premature stream cutoffs.
+  #     timeouts:
+  #       request: 30s
+
+# -- [NetworkPolicy](https://kubernetes.io/docs/concepts/services-networking/network-policies/) for the hub pods.
+# When enabled with no ingress/egress rules, all traffic to/from the
+# hub pods is denied. Supply rules to allow what you need.
+# @default -- Disabled by default.
+networkPolicy:
+  # -- Enable the NetworkPolicy.
+  enabled: false
+  # -- `policyTypes` for the NetworkPolicy. The chart always renders empty
+  # `ingress` and `egress` lists, so Kubernetes infers
+  # `policyTypes: [Ingress, Egress]`. Set to `[Ingress]` to skip egress.
+  policyTypes: []  # @schema itemEnum:[Ingress, Egress]
+  # policyTypes:
+  #   - Ingress
+  #   - Egress
+  # -- Ingress rules (allowed inbound traffic). Pass-through to
+  # `spec.ingress`. Empty list + `policyTypes: [Ingress]` denies all inbound.
+  ingress: []
+  # ingress:
+  #   - from:
+  #     - namespaceSelector:
+  #         matchLabels:
+  #           kubernetes.io/metadata.name: ingress-nginx
+  #     ports:
+  #     - protocol: TCP
+  #       port: 80
+  # -- Egress rules (allowed outbound traffic). Pass-through to `spec.egress`.
+  # Allow at least DNS (UDP/TCP 53 to kube-system) plus the transport port.
+  egress: []
+  # egress:
+  #   - to:
+  #     - namespaceSelector:
+  #         matchLabels:
+  #           kubernetes.io/metadata.name: kube-system
+  #     ports:
+  #     - protocol: UDP
+  #       port: 53
+  #     - protocol: TCP
+  #       port: 53
+
+# -- [CiliumNetworkPolicy](https://docs.cilium.io/en/stable/security/policy/)
+# for the hub pods. Use on Cilium clusters for features the standard
+# NetworkPolicy lacks (FQDN-based egress, L7 rules, explicit deny).
+# Independent of `networkPolicy.enabled`; enable whichever your CNI supports.
+# @default -- Disabled by default.
+ciliumNetworkPolicy:
+  # -- Enable the CiliumNetworkPolicy. Requires the `cilium.io/v2` CRDs to be
+  # installed in the cluster.
+  enabled: false
+  # -- Allowed inbound traffic. Pass-through to `spec.ingress`.
+  ingress: []
+  # ingress:
+  #   - fromEndpoints:
+  #       - matchLabels:
+  #           k8s:io.kubernetes.pod.namespace: ingress-nginx
+  #           app.kubernetes.io/name: ingress-nginx
+  #     toPorts:
+  #       - ports:
+  #           - port: "80"
+  #             protocol: TCP
+  # -- Explicit inbound deny rules. Pass-through to `spec.ingressDeny`.
+  ingressDeny: []
+  # -- Allowed outbound traffic. Pass-through to `spec.egress`. The DNS rule
+  # below is required when using `toFQDNs`: Cilium learns IPs by inspecting
+  # responses, so DNS visibility on `kube-dns` must be allowed first.
+  egress: []
+  # egress:
+  #   - toEndpoints:
+  #       - matchLabels:
+  #           k8s:io.kubernetes.pod.namespace: kube-system
+  #           k8s:k8s-app: kube-dns
+  #     toPorts:
+  #       - ports:
+  #           - port: "53"
+  #             protocol: ANY
+  #         rules:
+  #           dns:
+  #             - matchPattern: "*"
+  #   - toFQDNs:
+  #       - matchName: redis.example.com
+  #     toPorts:
+  #       - ports:
+  #           - port: "6379"
+  #             protocol: TCP
+  # -- Explicit outbound deny rules. Pass-through to `spec.egressDeny`.
+  egressDeny: []
+
+# -- Container resource [requests and limits](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/).
+# See the [API reference](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#resources) for details.
+# @default -- No requests or limits.
+resources: {}
+  # No defaults: leave the choice to the user. Set per your workload.
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+# -- Autoscaling must not be enabled unless you are using [the High Availability version](https://mercure.rocks/docs/hub/cluster) (see [values.yaml](values.yaml) for details).
+# @default -- Disabled by default.
+autoscaling:
+  enabled: false
+  minReplicas: 1  # @schema minimum:1
+  maxReplicas: 100  # @schema minimum:1
+  targetCPUUtilizationPercentage: 80  # @schema minimum:1;maximum:100
+  # targetMemoryUtilizationPercentage: 80
+  # -- Additional metrics appended to the HPA `spec.metrics` list (Pods, Object, External metric types).
+  customMetrics: []
+  # customMetrics:
+  #   - type: Pods
+  #     pods:
+  #       metric:
+  #         name: mercure_subscribers_connected
+  #       target:
+  #         type: AverageValue
+  #         averageValue: "1000"
+  # -- [Scaling policies](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#configurable-scaling-behavior) passed to the HPA `spec.behavior`.
+  behavior: {}
+  # behavior:
+  #   scaleDown:
+  #     policies:
+  #       - type: Pods
+  #         value: 1
+  #         periodSeconds: 300
+
+# -- [Node selector](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector) configuration.
+nodeSelector: {}
+
+# -- [Tolerations](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/) for node taints.
+# See the [API reference](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#scheduling) for details.
+tolerations: []
+
+# -- [Affinity](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity) configuration.
+# See the [API reference](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#scheduling) for details.
+affinity: {}
+
+# -- [Topology spread constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/) rendered into the pod spec. Evaluated as a Helm template, so it can reference `mercure.selectorLabels`.
+topologySpreadConstraints: ""
+# Example:
+#  topologySpreadConstraints: |
+#    - maxSkew: 1
+#      topologyKey: kubernetes.io/hostname
+#      whenUnsatisfiable: DoNotSchedule
+#      labelSelector:
+#        matchLabels:
+#          {{- include "mercure.selectorLabels" . | nindent 12 }}
+
+# -- Switch /data from an emptyDir to a [Persistent Volume Claim](http://kubernetes.io/docs/user-guide/persistent-volumes/).
+# /data is always mounted so modules writing under `caddy.AppDataDir()`
+# (e.g. `rate_limit`) work under `readOnlyRootFilesystem: true`. Enable
+# persistence when /data must survive pod restarts (typical with BoltDB).
+persistence:
+  enabled: false
+  # -- Mercure Data Persistent Volume Storage Class.
+  # If defined, `storageClassName: <storageClass>`.
+  # If set to `"-"`, `storageClassName: ""`, which disables dynamic provisioning.
+  # If undefined (the default) or set to `null`, no `storageClassName` spec is set, choosing the default provisioner.
+  storageClass: ""  # @schema type:[string, null]
+
+  # -- A manually managed Persistent Volume and Claim.
+  # Requires `persistence.enabled: true`
+  # If defined, PVC must be created manually before volume will be bound.
+  accessMode: ReadWriteOnce
+  size: 1Gi
+
+  # -- a manually managed Persistent Volume Claim
+  # -- Requires `persistence.enabled: true`
+  # -- If defined, PVC must be created manually before volume will be bound
+  existingClaim: ""
+
+# -- Additional volumes to set. `mercure-data`, `mercure-config` and `mercure-tmp` are reserved names.
+extraVolumes: []  # @schema type:[array]
+
+# -- Additional volume mounts to set.
+extraVolumeMounts: []  # @schema type:[array]

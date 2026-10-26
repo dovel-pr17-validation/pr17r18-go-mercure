@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Mercure</title>
+    <link rel="stylesheet" href="app.css" />
+    <link rel="icon" href="favicon.ico" />
+  </head>
+
+  <body>
+    <nav class="nav">
+      <a href="https://mercure.rocks" target="_blank" rel="noopener noreferrer">
+        <img src="mercure.svg" alt="Mercure" />
+      </a>
+      <span class="nav-mode" id="mode">Debugger</span>
+      <span class="nav-spacer"></span>
+      <span class="status" id="status" data-state="off">Disconnected</span>
+      <a
+        class="hint"
+        href="https://mercure.rocks/docs"
+        target="_blank"
+        rel="noopener noreferrer"
+        >Docs ↗</a
+      >
+    </nav>
+
+    <div class="wrap">
+      <div class="banner hidden" id="playground-banner">
+        <span aria-hidden="true">⚠️</span>
+        <div>
+          <strong>Insecure playground hub.</strong> The JWT below is an
+          all-access token (publish and subscribe on every topic) minted by the
+          hub, and the discovery endpoints echo whatever you send them. Never
+          enable the <code>playground</code> directive in production.
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="col">
+          <section class="card">
+            <h2>Subscribe</h2>
+            <p class="hint">Open a live Server-Sent Events stream.</p>
+            <form name="subscribe">
+              <div class="field">
+                <label>Matcher type</label>
+                <div class="tabs" role="tablist" data-target="matcherType">
+                  <button
+                    type="button"
+                    role="tab"
+                    data-value="match"
+                    aria-selected="true"
+                  >
+                    Exact
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    data-value="match_urlpattern"
+                    aria-selected="false"
+                  >
+                    URL Pattern
+                  </button>
+                </div>
+                <input type="hidden" name="matcherType" value="match" />
+              </div>
+
+              <div class="field">
+                <label for="subscribeTopics">Topics to subscribe to</label>
+                <textarea name="topics" id="subscribeTopics" required>
+https://example.com/books/1</textarea>
+                <p class="hint">
+                  One topic per line, read with the matcher type above. Use
+                  <code>*</code> to subscribe to every topic.
+                </p>
+              </div>
+
+              <div class="field">
+                <label for="lastEventId">Last Event ID</label>
+                <input
+                  name="lastEventId"
+                  id="lastEventId"
+                  placeholder="optional"
+                />
+              </div>
+
+              <div class="actions">
+                <button class="btn btn-primary" name="subscribe">
+                  Subscribe
+                </button>
+                <button
+                  class="btn btn-ghost"
+                  name="unsubscribe"
+                  type="button"
+                  disabled
+                >
+                  Unsubscribe
+                </button>
+              </div>
+            </form>
+          </section>
+
+          <div class="window">
+            <div class="window-bar">
+              <span class="dot"></span>
+              <span class="dot"></span>
+              <span class="dot"></span>
+              <span class="title">updates</span>
+              <span class="count" id="updateCount"></span>
+            </div>
+            <ol class="log" id="updates" reversed>
+              <li class="empty">Not subscribed.</li>
+            </ol>
+          </div>
+          <template id="update">
+            <li class="event">
+              <div class="meta">
+                <span class="id"></span>
+                <span class="time"></span>
+              </div>
+              <pre></pre>
+            </li>
+          </template>
+        </div>
+
+        <div class="col">
+          <section class="card">
+            <h2>Settings</h2>
+            <form name="settings">
+              <div class="field">
+                <label for="hubUrl">Hub URL</label>
+                <input type="url" name="hubUrl" id="hubUrl" required />
+              </div>
+
+              <div class="field">
+                <label>Authorization</label>
+                <div class="radios">
+                  <label>
+                    <input
+                      type="radio"
+                      name="authorization"
+                      value="header"
+                      checked
+                    />
+                    <code>Authorization</code> header
+                  </label>
+                  <label id="cookieAuthLabel">
+                    <input type="radio" name="authorization" value="cookie" />
+                    Cookie
+                  </label>
+                </div>
+              </div>
+
+              <div class="field">
+                <label for="jwt">JWT</label>
+                <input
+                  type="text"
+                  name="jwt"
+                  id="jwt"
+                  placeholder="paste an access token"
+                />
+                <p class="hint">
+                  <span id="jwtHint"
+                    >Required to publish, or to subscribe to private topics.
+                    Mint one with <code>caddy mercure-token</code>.</span
+                  >
+                  <a
+                    id="jwtInspect"
+                    href="https://jwt.io"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    >Inspect &amp; edit ↗</a
+                  >
+                </p>
+              </div>
+            </form>
+          </section>
+
+          <section class="card">
+            <h2>Publish</h2>
+            <p class="hint">Send an update to one or more topics.</p>
+            <form name="publish">
+              <div class="field">
+                <label for="publishTopics">Topics</label>
+                <textarea name="topics" id="publishTopics" required>
+https://example.com/books/1</textarea>
+                <p class="hint">One update is published per line.</p>
+              </div>
+
+              <div class="field">
+                <label class="checkbox">
+                  <input type="checkbox" name="priv" />
+                  Private update
+                </label>
+              </div>
+
+              <div class="field">
+                <label for="data">Data</label>
+                <textarea name="data" id="data"></textarea>
+              </div>
+
+              <div class="field">
+                <label for="eventId">Event ID</label>
+                <input name="id" id="eventId" placeholder="optional" />
+              </div>
+
+              <div class="field">
+                <label for="eventType">Event type</label>
+                <input name="type" id="eventType" placeholder="optional" />
+              </div>
+
+              <div class="field">
+                <label for="eventRetry">Retry (ms)</label>
+                <input name="retry" id="eventRetry" placeholder="optional" />
+              </div>
+
+              <div class="actions">
+                <button class="btn btn-primary">Publish</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="card hidden" id="discoverCard">
+            <h2>Discover</h2>
+            <p class="hint">
+              Fetch a playground endpoint (any subpath of
+              <code>/playground</code>) that returns a
+              <code>Link rel="mercure"</code> header and echoes the body below.
+            </p>
+            <form name="discover">
+              <div class="field">
+                <label for="topic">Topic</label>
+                <input type="url" name="topic" id="topic" required />
+              </div>
+
+              <div class="field">
+                <label for="body">Playground body</label>
+                <textarea name="body" id="body"></textarea>
+              </div>
+
+              <div class="actions">
+                <button class="btn btn-primary" name="discover">
+                  Discover
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+
+        <section class="card span-2">
+          <h2>Active subscriptions</h2>
+          <p class="hint" id="subscriptionsHint">
+            Requires the subscription API (the <code>subscriptions</code>
+            directive).
+          </p>
+          <form name="subscriptions">
+            <div class="actions">
+              <button class="btn btn-primary" name="subscribe">
+                Fetch &amp; watch
+              </button>
+              <button
+                class="btn btn-ghost"
+                name="unsubscribe"
+                type="button"
+                disabled
+              >
+                Stop
+              </button>
+            </div>
+          </form>
+          <div class="subs" id="subscriptions"></div>
+          <template id="subscription">
+            <div class="sub">
+              <div class="id"></div>
+              <dl>
+                <dt>Type</dt>
+                <dd class="match-type"></dd>
+                <dt>Matcher</dt>
+                <dd class="match"></dd>
+                <dt>Subscriber</dt>
+                <dd class="subscriber"></dd>
+                <dt class="payload-label">Payload</dt>
+                <pre></pre>
+              </dl>
+            </div>
+          </template>
+        </section>
+      </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

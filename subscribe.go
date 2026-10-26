@@ -1,0 +1,743 @@
+package mercure
+
+import (
+	"context"
+	jsonv2 "encoding/json/v2"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/rand/v2"
+	"mime"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/elnormous/contenttype"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// methodQuery is the safe, idempotent HTTP QUERY method (RFC 9110 semantics,
+// defined in RFC 10008). Subscribers use it to send the topic matcher list in
+// the request body instead of the URL, avoiding query-string length limits.
+const methodQuery = "QUERY"
+
+type subscriberContextKeyType struct{}
+
+var SubscriberContextKey subscriberContextKeyType //nolint:gochecknoglobals
+
+type responseController struct {
+	http.ResponseController
+
+	rw http.ResponseWriter
+
+	// disconnectionTime is the JWT expiration date minus hub.dispatchTimeout, or time.Now() plus hub.writeTimeout minus hub.dispatchTimeout
+	disconnectionTime time.Time
+	// writeDeadline is the JWT expiration date or time.Now() + hub.writeTimeout
+	writeDeadline time.Time
+	hub           *Hub
+	subscriber    *LocalSubscriber
+}
+
+func (rc *responseController) setDispatchWriteDeadline(ctx context.Context) bool {
+	if rc.hub.dispatchTimeout == 0 {
+		return true
+	}
+
+	deadline := time.Now().Add(rc.hub.dispatchTimeout)
+	if !rc.writeDeadline.IsZero() && deadline.After(rc.writeDeadline) {
+		return true
+	}
+
+	if err := rc.SetWriteDeadline(deadline); err != nil && rc.hub.logger.Enabled(ctx, slog.LevelInfo) {
+		rc.hub.logger.LogAttrs(ctx, slog.LevelInfo, "Unable to set dispatch write deadline", slog.Any("error", err))
+
+		return false
+	}
+
+	return true
+}
+
+func (rc *responseController) setDefaultWriteDeadline(ctx context.Context) bool {
+	if err := rc.SetWriteDeadline(rc.writeDeadline); err != nil {
+		rc.hub.handleWriterError(ctx, err, "Error while setting default write deadline")
+
+		return false
+	}
+
+	return true
+}
+
+func (rc *responseController) flush(ctx context.Context) bool {
+	if err := rc.Flush(); err != nil {
+		rc.hub.handleWriterError(ctx, err, "Error while flushing response")
+
+		return false
+	}
+
+	return true
+}
+
+func (h *Hub) newResponseController(w http.ResponseWriter, s *LocalSubscriber) *responseController {
+	wd := h.getWriteDeadline(s)
+
+	// Disconnect one dispatch before the write deadline so the client sees a
+	// clean end of stream instead of a failed write. That subtraction lands in
+	// the past when the deadline is nearer than dispatchTimeout — a token
+	// expiring within it, or a dispatchTimeout larger than writeTimeout — which
+	// would close the connection as soon as it opened and put the subscriber in
+	// a reconnect loop. Fall back to the deadline itself: less margin, but the
+	// subscriber gets the time its token grants. A zero deadline means no
+	// deadline at all, and SubscribeHandler then arms no timer.
+	dt := wd
+	if !wd.IsZero() {
+		if d := wd.Add(-h.dispatchTimeout); d.After(time.Now()) {
+			dt = d
+		}
+	}
+
+	return &responseController{
+		*http.NewResponseController(w), // nolint:bodyclose
+		w,
+		dt,
+		wd,
+		h,
+		s,
+	}
+}
+
+func (h *Hub) getWriteDeadline(s *LocalSubscriber) (deadline time.Time) {
+	if h.writeTimeout != 0 {
+		deadline = time.Now().Add(randomizeWriteDeadline(h.writeTimeout))
+	}
+
+	if s.Claims != nil && s.Claims.ExpiresAt != nil && (deadline.Equal(time.Time{}) || s.Claims.ExpiresAt.Before(deadline)) {
+		now := time.Now()
+		deadline = now.Add(randomizeWriteDeadline(s.Claims.ExpiresAt.Sub(now)))
+	}
+
+	return deadline
+}
+
+// SubscribeHandler creates a keep alive connection and sends the events to the subscribers.
+//
+//nolint:funlen,gocognit
+func (h *Hub) SubscribeHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	s, rc := h.registerSubscriber(ctx, w, r)
+	if s == nil {
+		return
+	}
+
+	ctx = context.WithValue(ctx, SubscriberContextKey, &s.Subscriber)
+
+	defer h.shutdown(ctx, s)
+
+	rc.setDefaultWriteDeadline(ctx)
+
+	var (
+		heartbeatTimer      *time.Timer
+		heartbeatTimerC     <-chan time.Time
+		disconnectionTimer  *time.Timer
+		disconnectionTimerC <-chan time.Time
+	)
+
+	if h.heartbeat != 0 {
+		heartbeatTimer = time.NewTimer(h.heartbeat)
+		defer heartbeatTimer.Stop()
+
+		heartbeatTimerC = heartbeatTimer.C
+	}
+
+	// The drain may arm the timer later, for a subscriber that starts without a deadline.
+	defer func() {
+		if disconnectionTimer != nil {
+			disconnectionTimer.Stop()
+		}
+	}()
+
+	// Arm the disconnection timer whenever a write deadline exists, including
+	// when it comes solely from the token's exp (write_timeout disabled):
+	// getWriteDeadline leaves the deadline zero only when neither a write
+	// timeout nor a token exp applies. The protocol requires closing the
+	// connection no later than exp, so relying on a failed write against a past
+	// deadline would otherwise leave an authenticated connection open up to a
+	// heartbeat interval past exp, or indefinitely with heartbeat off.
+	if !rc.writeDeadline.IsZero() {
+		disconnectionTimer = time.NewTimer(time.Until(rc.disconnectionTime))
+
+		disconnectionTimerC = disconnectionTimer.C
+	}
+
+	debugLevel := rc.hub.logger.Enabled(ctx, slog.LevelDebug)
+
+	// Reloads cancel h.ctx without draining; deadline-less connections must still exit or Shutdown hangs.
+	var (
+		hubCtxDoneC <-chan struct{}
+		drainC      <-chan struct{}
+	)
+
+	if h.writeTimeout == 0 {
+		hubCtxDoneC = h.ctx.Done()
+	}
+
+	if h.drainTimeout != 0 {
+		drainC = h.drainCh
+	}
+
+	for {
+		select {
+		case <-hubCtxDoneC:
+			if debugLevel {
+				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Hub is shutting down, closing connection")
+			}
+
+			return
+		case <-drainC:
+			drainC = nil
+
+			deadline, reschedule := drainDisconnectionTime(time.Now(), rc.disconnectionTime, drainDeadline(h.drainTimeout))
+			if !reschedule {
+				continue
+			}
+
+			if debugLevel {
+				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Hub is draining, rescheduling disconnection", slog.Time("disconnection_time", deadline))
+			}
+
+			rc.disconnectionTime = deadline
+			// Never extend the deadline, which may come from the token exp.
+			if wd := deadline.Add(h.dispatchTimeout); rc.writeDeadline.IsZero() || wd.Before(rc.writeDeadline) {
+				rc.writeDeadline = wd
+			}
+
+			rc.setDefaultWriteDeadline(ctx)
+
+			if disconnectionTimer == nil {
+				disconnectionTimer = time.NewTimer(time.Until(deadline))
+				disconnectionTimerC = disconnectionTimer.C
+			} else {
+				disconnectionTimer.Reset(time.Until(deadline))
+			}
+		case <-ctx.Done():
+			if debugLevel {
+				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Connection closed by the client")
+			}
+
+			return
+		case <-heartbeatTimerC:
+			// Send an SSE comment as a heartbeat, to prevent issues with some proxies and old browsers
+			if !h.write(ctx, rc, ":\n") {
+				return
+			}
+
+			heartbeatTimer.Reset(h.heartbeat)
+		case <-disconnectionTimerC:
+			// Cleanly close the HTTP connection before the write deadline to prevent client-side errors
+			return
+		case update, ok := <-s.Receive():
+			if !ok || !h.write(ctx, rc, newSerializedUpdate(update).event) {
+				return
+			}
+
+			// An update counts as activity, so push the heartbeat back. Go 1.23
+			// made timer channels unbuffered and has Reset discard any pending
+			// value, so Reset alone is enough: no Stop-and-drain dance.
+			if heartbeatTimer != nil {
+				heartbeatTimer.Reset(h.heartbeat)
+			}
+
+			if debugLevel {
+				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Update sent", slog.Any("update", update))
+			}
+		}
+	}
+}
+
+// registerSubscriber initializes the connection.
+func (h *Hub) registerSubscriber(ctx context.Context, w http.ResponseWriter, r *http.Request) (*LocalSubscriber, *responseController) { //nolint:funlen
+	ctx, span := startSpan(ctx, "mercure.subscribe", trace.WithSpanKind(trace.SpanKindConsumer))
+	defer span.End()
+
+	h.limitRequestBody(w, r)
+
+	// Advertised on every answer, refusals included: a client told 415 needs
+	// to know what it should have sent (RFC 10008, Section 3).
+	w.Header()["Accept-Query"] = headerAcceptQuery
+
+	values, err := h.subscribeValues(r)
+	if err != nil {
+		status := http.StatusBadRequest
+
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+			status = http.StatusRequestEntityTooLarge
+		} else if errors.Is(err, errUnsupportedSubscriptionMediaType) {
+			status = http.StatusUnsupportedMediaType
+		}
+
+		http.Error(w, http.StatusText(status), status)
+		recordSpanError(span, err)
+
+		return nil, nil
+	}
+
+	// A subscriber refusing text/event-stream leaves nothing for the hub to
+	// send (RFC 9110, Section 12.5.1).
+	if !acceptsEventStream(r) {
+		http.Error(w, http.StatusText(http.StatusNotAcceptable), http.StatusNotAcceptable)
+		recordSpanError(span, errNotAcceptable)
+
+		return nil, nil
+	}
+
+	lastEventID, lastEventIDSet := h.retrieveLastEventID(ctx, r, values)
+
+	var claims *claims
+
+	if h.subscriberConfigured { //nolint:nestif
+		var err error
+
+		claims, err = h.authorize(r, false)
+		if err != nil || (claims == nil && !h.anonymous) {
+			h.writeAuthError(w, r, err)
+
+			if err != nil {
+				recordSpanError(span, err)
+			}
+
+			return nil, nil
+		}
+	}
+
+	permit := h.reserveSubscription(w, r, claims)
+	if permit == nil {
+		return nil, nil
+	}
+
+	registered := false
+
+	defer func() {
+		if !registered {
+			permit.release()
+		}
+	}()
+
+	deprecated := h.isBackwardCompatiblyEnabledWith(8)
+
+	matchers, err := h.parseMatchers(values, deprecated)
+	if err != nil {
+		h.writeMatcherParamError(ctx, w, err)
+		recordSpanError(span, err)
+
+		return nil, nil
+	}
+
+	var privateTopicMatchers []TopicMatcher
+	if claims != nil {
+		privateTopicMatchers = claims.authz.subscribeMatchers()
+	}
+
+	s := NewLocalSubscriber(lastEventID, h.logger, h.topicMatcherStore)
+	s.RequestLastEventIDSet = lastEventIDSet
+	s.legacyClient = h.isLegacyClient(values)
+	h.logLegacyClientLastEventID(ctx, values, s.legacyClient)
+	s.Claims = claims
+	s.subscriptionPermit = permit
+	s.clientIP = h.clientIP(r)
+	s.setMatchers(matchers, privateTopicMatchers)
+
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.String("mercure.subscriber.id", s.ID),
+			attribute.StringSlice("mercure.topics", logMatcherPatterns(matchers)),
+		)
+	}
+
+	addCtx := context.WithoutCancel(ctx)
+
+	if err := h.transport.AddSubscriber(addCtx, s); err != nil {
+		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+
+		if h.logger.Enabled(ctx, slog.LevelError) {
+			h.logger.LogAttrs(ctx, slog.LevelError, "Unable to add subscriber", slog.Any("error", err))
+		}
+
+		// Not shutdown(): no active:true was sent, so no active:false must follow.
+		s.Disconnect()
+
+		if err := h.transport.RemoveSubscriber(addCtx, s); err != nil && h.logger.Enabled(ctx, slog.LevelError) {
+			h.logger.LogAttrs(ctx, slog.LevelError, "Failed to remove subscriber after a failed registration", slog.Any("error", err))
+		}
+
+		recordSpanError(span, err)
+
+		return nil, nil
+	}
+
+	// Announce the subscription only once it exists, so a failed registration
+	// cannot publish an active:true for a subscriber that never connected and
+	// then have to take it back. shutdown() already announces termination in
+	// this order: remove first, then dispatch active:false.
+	h.dispatchSubscriptionUpdate(addCtx, s, true)
+
+	h.sendHeaders(ctx, w, s)
+	rc := h.newResponseController(w, s)
+	rc.flush(ctx)
+
+	if h.logger.Enabled(ctx, slog.LevelInfo) {
+		if claims != nil && h.logger.Enabled(ctx, slog.LevelDebug) {
+			h.logger.LogAttrs(ctx, slog.LevelInfo, "New subscriber", slog.Any("subscriber", s), slog.String("client_ip", s.clientIP), slog.Any("payload", s.SubscriptionPayloads))
+		} else {
+			h.logger.LogAttrs(ctx, slog.LevelInfo, "New subscriber", slog.Any("subscriber", s), slog.String("client_ip", s.clientIP))
+		}
+	}
+
+	h.metrics.SubscriberConnected(s)
+
+	registered = true
+
+	return s, rc
+}
+
+//nolint:gochecknoglobals
+var (
+	headerConnection   = []string{"keep-alive"}
+	headerContentType  = []string{"text/event-stream"}
+	headerCacheControl = []string{"private, no-cache, no-store, must-revalidate, max-age=0"}
+	headerPragma       = []string{"no-cache"}
+	headerExpires      = []string{"0"}
+
+	headerXAccelBuffering = []string{"no"}
+
+	// Accept-Query advertises the media type of the QUERY request body
+	// (RFC 10008): the subscription parameters, form-encoded as for GET.
+	headerAcceptQuery = []string{"application/x-www-form-urlencoded"}
+
+	// Incremental (RFC 10036) tells intermediaries to forward each chunk as
+	// it is produced instead of buffering the response, the standardized
+	// counterpart of X-Accel-Buffering above.
+	headerIncremental = []string{"?1"}
+)
+
+// sendHeaders sends correct HTTP headers to create a keep-alive connection.
+func (h *Hub) sendHeaders(ctx context.Context, w http.ResponseWriter, s *LocalSubscriber) {
+	header := w.Header()
+
+	// Keep alive, useful only for HTTP 1 clients https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Keep-Alive
+	header["Connection"] = headerConnection
+
+	header["Content-Type"] = headerContentType
+
+	// Disable cache, even for old browsers and proxies
+	header["Cache-Control"] = headerCacheControl
+	header["Pragma"] = headerPragma
+	header["Expires"] = headerExpires
+
+	// NGINX support https://www.nginx.com/resources/wiki/start/topics/examples/x-accel/#x-accel-buffering
+	header["X-Accel-Buffering"] = headerXAccelBuffering
+	header["Incremental"] = headerIncremental
+
+	if s.RequestLastEventIDSet {
+		responseLastEventID := []string{<-s.responseLastEventID}
+		header["Mercure-Last-Event-Id"] = responseLastEventID
+
+		// 0.x clients read the reconciliation cursor from this field.
+		if s.legacyClient {
+			header["Last-Event-Id"] = responseLastEventID
+		}
+	}
+
+	// Write a comment in the body
+	// Go currently doesn't provide a better way to flush the headers
+	if _, err := w.Write([]byte{':', '\n'}); err != nil && h.logger.Enabled(ctx, slog.LevelInfo) {
+		h.logger.LogAttrs(ctx, slog.LevelInfo, "Failed to write comment", slog.Any("error", err))
+	}
+}
+
+// errUnsupportedSubscriptionMediaType rejects a QUERY subscription body
+// declaring a media type the hub cannot read.
+var errUnsupportedSubscriptionMediaType = errors.New("unsupported subscription media type")
+
+// errNotAcceptable rejects a subscription refusing the only media type the
+// hub can stream, leaving nothing to send it.
+var errNotAcceptable = errors.New("the request does not accept text/event-stream")
+
+// The only representation subscriptions are answered in, parsed once for
+// negotiation.
+//
+//nolint:gochecknoglobals
+var availableEventStream = []contenttype.MediaType{contenttype.NewMediaType("text/event-stream")}
+
+// acceptsEventStream reports whether the request's Accept header field allows
+// text/event-stream, per proactive content negotiation (RFC 9110, Section
+// 12.5.1): the most specific matching media range decides, so an explicit
+// text/event-stream wins over a "*/*;q=0" refusing everything else. An
+// absent or unreadable Accept states no preference.
+func acceptsEventStream(r *http.Request) bool {
+	// A blank Accept lists nothing, which the library reads as accepting
+	// nothing; treat it like an absent field instead.
+	joined := strings.TrimSpace(strings.Join(r.Header.Values("Accept"), ", "))
+	if strings.Trim(joined, ", ") == "" {
+		return true
+	}
+
+	// Field lines repeating Accept form one list (RFC 9110, Section 5.3);
+	// the library reads only the first line.
+	if len(r.Header.Values("Accept")) > 1 {
+		single := r.Clone(r.Context())
+		single.Header.Set("Accept", joined)
+		r = single
+	}
+
+	_, _, err := contenttype.GetAcceptableMediaType(r, availableEventStream)
+
+	return !errors.Is(err, contenttype.ErrNoAcceptableTypeFound)
+}
+
+// subscribeValues returns the subscription parameters. For GET and HEAD they
+// come from the URL query; for QUERY the application/x-www-form-urlencoded
+// request body is parsed and merged on top, so a subscriber can pass topics
+// either way. Body size is bounded by limitRequestBody, as for the publish
+// endpoint.
+func (h *Hub) subscribeValues(r *http.Request) (url.Values, error) {
+	values := r.URL.Query()
+	if r.Method != methodQuery {
+		return values, nil
+	}
+
+	// A QUERY naming no media type is incorrect by definition, and one naming
+	// a media type the hub cannot read as a subscription is unsupported
+	// (RFC 10008, Section 2.3). Neither is read as a form: a server does not
+	// infer a media type from the content it carries.
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid QUERY request Content-Type: %w", err)
+	}
+
+	if mediaType != "application/x-www-form-urlencoded" {
+		return nil, fmt.Errorf("%w: %q", errUnsupportedSubscriptionMediaType, mediaType)
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading QUERY request body: %w", err)
+	}
+
+	bodyValues, err := url.ParseQuery(string(body))
+	if err != nil {
+		return nil, fmt.Errorf("parsing QUERY request body: %w", err)
+	}
+
+	for k, vs := range bodyValues {
+		values[k] = append(values[k], vs...)
+	}
+
+	return values, nil
+}
+
+// isLegacyClient reports whether the request carries a subscribe query
+// parameter only 0.x clients send; parseMatchers refuses it beside a 1.x matcher.
+func (h *Hub) isLegacyClient(query url.Values) bool {
+	if !h.isBackwardCompatiblyEnabledWith(8) {
+		return false
+	}
+
+	_, topic := query[paramTopic]
+	_, lastEventID := query["lastEventID"]
+	_, v7LastEventID := query["Last-Event-ID"]
+
+	return topic || lastEventID || v7LastEventID
+}
+
+func (h *Hub) logLegacyClientLastEventID(ctx context.Context, query url.Values, legacyClient bool) {
+	if _, ok := query["last_event_id"]; !ok || !legacyClient || !h.logger.Enabled(ctx, slog.LevelInfo) {
+		return
+	}
+
+	h.logger.LogAttrs(ctx, slog.LevelInfo, `Deprecated: mixing the "last_event_id" query parameter with 0.x ones is deprecated, use "match" instead of "topic".`)
+}
+
+// retrieveLastEventID extracts the Last-Event-ID from the corresponding HTTP
+// header with a fallback on the query parameter. The second return value
+// reports whether either was present at all, even with an empty value: the
+// protocol requires answering with a Mercure-Last-Event-ID response field
+// whenever one was.
+func (h *Hub) retrieveLastEventID(ctx context.Context, r *http.Request, query url.Values) (string, bool) {
+	if id := r.Header.Get("Last-Event-ID"); id != "" {
+		return id, true
+	}
+
+	_, headerPresent := r.Header["Last-Event-Id"]
+
+	if id := query.Get("last_event_id"); id != "" {
+		return id, true
+	}
+
+	_, queryPresent := query["last_event_id"]
+
+	// Like 0.x, an empty lastEventID is ignored.
+	if h.isBackwardCompatiblyEnabledWith(8) {
+		if id := query.Get("lastEventID"); id != "" {
+			return id, true
+		}
+	}
+
+	if legacyEventIDValues, present := query["Last-Event-ID"]; present { //nolint:nestif
+		infoLevel := h.logger.Enabled(ctx, slog.LevelInfo)
+		if h.isBackwardCompatiblyEnabledWith(7) {
+			if infoLevel {
+				h.logger.LogAttrs(ctx, slog.LevelInfo, "Deprecated: the 'Last-Event-ID' query parameter is deprecated since the version 8 of the protocol, use 'last_event_id' instead.")
+			}
+
+			if len(legacyEventIDValues) != 0 {
+				return legacyEventIDValues[0], true
+			}
+		} else if infoLevel {
+			h.logger.LogAttrs(ctx, slog.LevelInfo, `Unsupported: the "Last-Event-ID" query parameter is not supported anymore, use "last_event_id" instead or enable backward compatibility with version 7 of the protocol.`)
+		}
+	}
+
+	return "", headerPresent || queryPresent
+}
+
+// Write sends the given string to the client.
+// It returns false if the subscriber has been disconnected (e.g. timeout).
+func (h *Hub) write(ctx context.Context, rc *responseController, data string) bool {
+	if !rc.setDispatchWriteDeadline(ctx) {
+		return false
+	}
+
+	if _, err := rc.rw.Write([]byte(data)); err != nil && h.logger.Enabled(ctx, slog.LevelDebug) {
+		h.logger.LogAttrs(ctx, slog.LevelDebug, "Failed to write comment", slog.Any("error", err))
+
+		return false
+	}
+
+	return rc.flush(ctx) && rc.setDefaultWriteDeadline(ctx)
+}
+
+func (h *Hub) shutdown(ctx context.Context, s *LocalSubscriber) {
+	defer s.subscriptionPermit.release()
+
+	// Notify that the client is closing the connection
+	s.Disconnect()
+
+	ctx = context.WithoutCancel(ctx)
+
+	if err := h.transport.RemoveSubscriber(ctx, s); err != nil && h.logger.Enabled(ctx, slog.LevelError) {
+		h.logger.LogAttrs(ctx, slog.LevelError, "Failed to remove subscriber on shutdown", slog.Any("error", err))
+	}
+
+	h.dispatchSubscriptionUpdate(ctx, s, false)
+
+	if h.logger.Enabled(ctx, slog.LevelInfo) {
+		h.logger.LogAttrs(ctx, slog.LevelInfo, "Subscriber disconnected", slog.Any("subscriber", s), slog.String("client_ip", s.clientIP))
+	}
+
+	h.metrics.SubscriberDisconnected(s)
+}
+
+func (h *Hub) dispatchSubscriptionUpdate(ctx context.Context, s *LocalSubscriber, active bool) {
+	if !h.subscriptions {
+		return
+	}
+
+	for _, subscription := range s.getSubscriptions(subscriptionFilter{}, active) {
+		j, err := jsonv2.Marshal(subscription, subscriptionJSONOptions)
+		if err != nil {
+			panic(err)
+		}
+
+		// Dispatched directly, bypassing Hub.Publish/Update.Validate: this is
+		// the only path allowed to set the reserved reservedEventType, and
+		// Validate would reject it. Safe because Topic and Data are hub-built
+		// here (subscription.ID is a hub-constructed path; the JSON encoder
+		// escapes control characters), not attacker-controlled. Keep that
+		// invariant if this function changes.
+		u := &Update{
+			Topics:  []string{subscription.ID},
+			Private: true,
+			Debug:   h.debug,
+			Data:    string(j),
+			Type:    reservedEventType,
+		}
+
+		if err := h.transport.Dispatch(ctx, u); err != nil && h.logger.Enabled(ctx, slog.LevelError) {
+			h.logger.LogAttrs(ctx, slog.LevelError, "Failed to dispatch update", slog.Any("update", u), slog.Any("subscription", subscription.ID), slog.Any("error", err))
+		}
+	}
+}
+
+// drainDisconnectionTime returns now+offset and true, unless the connection already closes sooner.
+func drainDisconnectionTime(now, existing time.Time, offset time.Duration) (time.Time, bool) {
+	deadline := now.Add(offset)
+	if !existing.IsZero() && !deadline.Before(existing) {
+		return existing, false
+	}
+
+	return deadline, true
+}
+
+// drainDeadline spreads reconnects uniformly over (0, drainTimeout]; drainTimeout must be positive.
+func drainDeadline(drainTimeout time.Duration) time.Duration {
+	return time.Duration(rand.Int64N(int64(drainTimeout)) + 1) //nolint:gosec
+}
+
+// randomizeWriteDeadline generates a random duration between 80% and 100% of the original value.
+// This is useful to avoid all subscribers disconnecting at the same time, which can lead to a thundering herd problem.
+func randomizeWriteDeadline(originalValue time.Duration) time.Duration {
+	minV := int64(float64(originalValue) * 0.80)
+	maxV := int64(originalValue)
+
+	// Ensure min is not greater than max. This handles cases where originalValue is very small (e.g., 1, 2, 3, 4).
+	// For originalValue = 1, min becomes 0. For originalValue = 4, min becomes 3.
+	// This shouldn't happen in practice, but it's a good safeguard.
+	if minV > maxV {
+		minV = maxV
+	}
+
+	// Calculate the range size. Add 1 because Int64N is exclusive of the upper bound.
+	rangeSize := maxV - minV + 1
+
+	// If rangeSize is 0 or less (e.g., if originalValue was 0), just return min (which would be 0).
+	// rand.Int64N requires a positive argument.
+	if rangeSize <= 0 {
+		return time.Duration(minV)
+	}
+
+	// Generate a random number in the range [min, max]
+	// rand.Int64n(n) returns a non-negative pseudo-random 64-bit integer in the half-open interval [0, n).
+	// Adding 'min' shifts this result to the desired range [min, max].
+	return time.Duration(rand.Int64N(rangeSize) + minV) //nolint:gosec
+}
+
+func (h *Hub) handleWriterError(ctx context.Context, err error, message string) {
+	if errors.Is(err, http.ErrNotSupported) {
+		panic(err)
+	}
+
+	if h.logger.Enabled(ctx, slog.LevelInfo) {
+		h.logger.LogAttrs(ctx, slog.LevelInfo, message, slog.Any("error", err))
+	}
+}
+
+// writeMatcherParamError answers a subscribe-query matcher error with 400. For
+// an invalid pattern it writes a generic message and logs the detail: the
+// underlying URL Pattern compiler can embed internal memory addresses in its
+// error text (CWE-209), which must not reach the client.
+func (h *Hub) writeMatcherParamError(ctx context.Context, w http.ResponseWriter, err error) {
+	if errors.Is(err, errInvalidMatcherPattern) {
+		http.Error(w, errInvalidMatcherPattern.Error(), http.StatusBadRequest)
+
+		if h.logger.Enabled(ctx, slog.LevelDebug) {
+			h.logger.LogAttrs(ctx, slog.LevelDebug, "Invalid topic matcher pattern in subscribe request", slog.Any("error", err))
+		}
+
+		return
+	}
+
+	http.Error(w, err.Error(), http.StatusBadRequest)
+}
